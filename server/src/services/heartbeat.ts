@@ -20093,6 +20093,23 @@ export function heartbeatService(
   // Budget, pause-hold, dependency, and staleness outcomes are unchanged:
   // claimQueuedRun still decides all of them exactly as before; the gate only
   // decides *when* a healthy run claims.
+  //
+  // Known approximations of this mirror (review findings 1-2, deliberately
+  // accepted — both are bounded queue latency, never liveness):
+  // 1. The issue-lock check is more conservative than lockIssueExecutionClaim:
+  //    ANY executionRunId (even terminal/settling) and ANY foreign
+  //    checkoutRunId count as unclaimable here, while the real claim path only
+  //    blocks on an actively-settling executionRunId and on
+  //    `native_safe_replacement` checkouts. An older run in those transient
+  //    states therefore gets no reservation and can lose a fast-path slot to a
+  //    younger candidate — bounded to ~one sweep tick because the oldest-first
+  //    sweep re-drives it next tick.
+  // 2. The mirror does not model budgets, pause holds, daily caps, or
+  //    staleness (all decided inside claimQueuedRun). A run that would be
+  //    cancelled or rejected at claim can reserve a slot while queued
+  //    ("phantom reservation"); its agent is re-driven every sweep tick and
+  //    the claim attempt settles it, so over-reservation is also bounded to
+  //    ~one sweep tick and never head-of-line blocks the fleet.
   // ---------------------------------------------------------------------------
   async function countOlderClaimableCrossAgentQueuedRuns(candidate: {
     id: string;
@@ -20298,16 +20315,23 @@ export function heartbeatService(
       }
       if (availableSlots <= 0) {
         // TOP-387: these exits used to be silent and cost hours of diagnosis.
+        // Both caps can bind at once (review finding 5): keep the primary
+        // reason for filtering and carry both binding flags in the payload.
+        const agentSlotsBinding = runningCount >= policy.maxConcurrentRuns;
+        const globalSlotsBinding =
+          globalRunningCount !== null &&
+          globalMaxConcurrentRuns !== null &&
+          globalRunningCount >= globalMaxConcurrentRuns;
         await logStartNoClaim(
           agentId,
-          runningCount >= policy.maxConcurrentRuns
-            ? "no_slots_agent"
-            : "no_slots_global",
+          agentSlotsBinding ? "no_slots_agent" : "no_slots_global",
           {
             agentRunning: runningCount,
             agentMaxConcurrentRuns: policy.maxConcurrentRuns,
             globalRunning: globalRunningCount,
             globalMaxConcurrentRuns,
+            agentSlotsBinding,
+            globalSlotsBinding,
           },
         );
         return [];

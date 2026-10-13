@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -159,6 +160,7 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     agentId: string,
     status: "queued" | "running",
     ageMs = 60_000,
+    issueId?: string,
   ) {
     const wakeupRequestId = randomUUID();
     const runId = randomUUID();
@@ -182,6 +184,7 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
       triggerDetail: "manual",
       status,
       wakeupRequestId,
+      ...(issueId ? { contextSnapshot: { issueId } } : {}),
       ...(status === "running" ? { processPid: process.pid } : {}),
       createdAt: new Date(Date.now() - ageMs),
     });
@@ -248,9 +251,15 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     ).toHaveLength(1);
     // Claim is synchronous; the fire-and-forget dispatch reaches the adapter
     // a few awaits later (and then blocks on the gate).
-    await vi.waitFor(() => {
-      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
-    });
+    // Explicit timeout: the claim->adapter dispatch hop is fire-and-forget and
+    // can exceed vi.waitFor's 1s default on a cold, loaded run (observed flake,
+    // review finding 4).
+    await vi.waitFor(
+      () => {
+        expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 5000 },
+    );
 
     // Release the claimed run; once it finishes, the next sweep pass (the
     // periodic recovery sweep in production) promotes the rest.
@@ -314,9 +323,15 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     });
     await insertRun(companyId, agentB, "queued");
     await heartbeat.resumeQueuedRuns();
-    await vi.waitFor(() => {
-      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
-    });
+    // Explicit timeout: the claim->adapter dispatch hop is fire-and-forget and
+    // can exceed vi.waitFor's 1s default on a cold, loaded run (observed flake,
+    // review finding 4).
+    await vi.waitFor(
+      () => {
+        expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 5000 },
+    );
 
     // Backlog accumulates while B runs: A's run is strictly older than B's
     // second run, and A has no running runs to self-refill from.
@@ -366,9 +381,15 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     });
     await insertRun(companyId, agentB, "queued");
     await fairnessOff.resumeQueuedRuns();
-    await vi.waitFor(() => {
-      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
-    });
+    // Explicit timeout: the claim->adapter dispatch hop is fire-and-forget and
+    // can exceed vi.waitFor's 1s default on a cold, loaded run (observed flake,
+    // review finding 4).
+    await vi.waitFor(
+      () => {
+        expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 5000 },
+    );
 
     const queuedOldA = await insertRun(companyId, agentA, "queued", 3_600_000);
     const queuedNewB = await insertRun(companyId, agentB, "queued", 60_000);
@@ -381,5 +402,69 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     // slot even though A's run is strictly older.
     expect(await runStatus(queuedNewB)).toMatchObject({ status: "succeeded" });
     expect(await runStatus(queuedOldA)).toMatchObject({ status: "queued" });
+  });
+
+  // Review finding 3: the claimability mirror must NOT reserve for an
+  // unclaimable older run. A's old run points at an issue that is currently
+  // executing under another live run (executionRunId set, non-terminal), so
+  // lockIssueExecutionClaim blocks its claim (issueClaim.blocked); if it still
+  // reserved the freed slot the fleet would head-of-line block behind a run
+  // that cannot claim. Cap 2 leaves the executing run's slot honest: one slot
+  // is the executing run, the other is the race under test.
+  it("does not reserve the freed slot for an older unclaimable run (issue executing) - no head-of-line blocking", async () => {
+    const capTwo = heartbeatService(db, {
+      runtimeEnv: { HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS: "2" },
+    });
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Locked Agent A");
+    const agentB = await insertAgent(companyId, "Refill Agent B");
+    const agentC = await insertAgent(companyId, "Executor Agent C");
+    // The issue's live executing run: non-terminal executionRunId genuinely
+    // blocks A's claim (verified in lockIssueExecutionClaim), and it holds one
+    // of the two fleet-wide slots for the whole scenario.
+    const executingRunId = await insertRun(companyId, agentC, "running");
+    const executingIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: executingIssueId,
+      companyId,
+      title: "Issue executing under another run",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentA,
+      executionRunId: executingRunId,
+    });
+    adapterGate = new Promise<void>((resolve) => {
+      releaseHeldRun = resolve;
+    });
+    await insertRun(companyId, agentB, "queued");
+    await capTwo.resumeQueuedRuns();
+    // Explicit timeout: the claim->adapter dispatch hop is fire-and-forget and
+    // can exceed vi.waitFor's 1s default on a cold, loaded run (observed flake,
+    // review finding 4).
+    await vi.waitFor(
+      () => {
+        expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      },
+      { timeout: 5000 },
+    );
+
+    const lockedOldA = await insertRun(
+      companyId,
+      agentA,
+      "queued",
+      3_600_000,
+      executingIssueId,
+    );
+    const queuedNewB = await insertRun(companyId, agentB, "queued", 60_000);
+
+    adapterGate = null;
+    releaseHeldRun();
+    await capTwo.drainActiveRunExecutions();
+
+    // A's old run is unclaimable and reserves nothing: B's self-refill takes
+    // the freed slot immediately, exactly as it would with no backlog.
+    expect(await runStatus(queuedNewB)).toMatchObject({ status: "succeeded" });
+    expect(await runStatus(lockedOldA)).toMatchObject({ status: "queued" });
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
   });
 });
