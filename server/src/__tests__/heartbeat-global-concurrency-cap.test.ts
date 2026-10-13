@@ -14,6 +14,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   heartbeatService,
+  parseGlobalClaimFairnessDisabled,
   parseGlobalMaxConcurrentRuns,
 } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
@@ -22,6 +23,8 @@ import { runningProcesses } from "../adapters/index.ts";
 // asserts the admission state of the other queued runs (dispatch is
 // fire-and-forget, so without the gate the finalize race would be flaky).
 let adapterGate: Promise<void> | null = null;
+// Resolver for the currently held adapter gate (set alongside adapterGate).
+let releaseHeldRun: () => void = () => {};
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => {
@@ -72,6 +75,22 @@ describe("parseGlobalMaxConcurrentRuns", () => {
   });
 });
 
+describe("parseGlobalClaimFairnessDisabled", () => {
+  it("keeps fairness enabled unless the kill switch is explicitly set", () => {
+    expect(parseGlobalClaimFairnessDisabled(undefined)).toBe(false);
+    expect(parseGlobalClaimFairnessDisabled(null)).toBe(false);
+    expect(parseGlobalClaimFairnessDisabled("")).toBe(false);
+    expect(parseGlobalClaimFairnessDisabled("on")).toBe(false);
+    expect(parseGlobalClaimFairnessDisabled("1")).toBe(false);
+    expect(parseGlobalClaimFairnessDisabled("off")).toBe(true);
+    expect(parseGlobalClaimFairnessDisabled("OFF")).toBe(true);
+    expect(parseGlobalClaimFairnessDisabled(" false ")).toBe(true);
+    expect(parseGlobalClaimFairnessDisabled("0")).toBe(true);
+    expect(parseGlobalClaimFairnessDisabled("disabled")).toBe(true);
+    expect(parseGlobalClaimFairnessDisabled(0)).toBe(true);
+  });
+});
+
 describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -87,6 +106,7 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
 
   afterEach(async () => {
     adapterGate = null;
+    releaseHeldRun = () => {};
     await heartbeat.drainActiveRunExecutions();
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
@@ -138,6 +158,7 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     companyId: string,
     agentId: string,
     status: "queued" | "running",
+    ageMs = 60_000,
   ) {
     const wakeupRequestId = randomUUID();
     const runId = randomUUID();
@@ -162,7 +183,7 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
       status,
       wakeupRequestId,
       ...(status === "running" ? { processPid: process.pid } : {}),
-      createdAt: new Date(Date.now() - 60_000),
+      createdAt: new Date(Date.now() - ageMs),
     });
     return runId;
   }
@@ -274,5 +295,91 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
     expect(await runStatus(queuedA)).toMatchObject({ status: "succeeded" });
     expect(await runStatus(queuedB)).toMatchObject({ status: "succeeded" });
+  });
+
+  // TOP-387 starvation regression: agent A holds the globally oldest queued
+  // run but has no running runs, so it never gets a self-refill. Under the old
+  // first-come-first-served claim order, the freed fleet-wide slot was taken
+  // within milliseconds by agent B's self-refill (executeRun cleanup ->
+  // startNextQueuedRunForAgent(B)) even though B's run was created much later,
+  // and A starved across arbitrarily many sweeps.
+  it("reserves a freed fleet-wide slot for the oldest cross-agent queued run instead of the finishing run's self-refill", async () => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Starved Agent A");
+    const agentB = await insertAgent(companyId, "Self-refill Agent B");
+    // B holds the single fleet-wide slot via a real claimed run so its
+    // completion exercises the production self-refill path.
+    adapterGate = new Promise<void>((resolve) => {
+      releaseHeldRun = resolve;
+    });
+    await insertRun(companyId, agentB, "queued");
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => {
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    });
+
+    // Backlog accumulates while B runs: A's run is strictly older than B's
+    // second run, and A has no running runs to self-refill from.
+    const queuedOldA = await insertRun(companyId, agentA, "queued", 3_600_000);
+    const queuedNewB = await insertRun(companyId, agentB, "queued", 60_000);
+
+    // Finish B's held run; its cleanup self-refills agent B, the exact race
+    // that starved A in production. Later runs are not gated.
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+
+    // Fairness: the freed slot was NOT handed to B's newer run during the
+    // self-refill; both stay queued, reserved for the older run.
+    expect(await runStatus(queuedNewB)).toMatchObject({ status: "queued" });
+    expect(await runStatus(queuedOldA)).toMatchObject({ status: "queued" });
+
+    // Within one scheduler tick the oldest run claims the freed slot; B's
+    // newer run keeps waiting behind it.
+    adapterGate = new Promise<void>((resolve) => {
+      releaseHeldRun = resolve;
+    });
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(queuedOldA)).toMatchObject({ status: "running" });
+    expect(await runStatus(queuedNewB)).toMatchObject({ status: "queued" });
+
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(queuedOldA)).toMatchObject({ status: "succeeded" });
+    expect(await runStatus(queuedNewB)).toMatchObject({ status: "queued" });
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps first-come-first-served self-refill when HEARTBEAT_GLOBAL_CLAIM_FAIRNESS=off", async () => {
+    const fairnessOff = heartbeatService(db, {
+      runtimeEnv: {
+        HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS: "1",
+        HEARTBEAT_GLOBAL_CLAIM_FAIRNESS: "off",
+      },
+    });
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Legacy Starved Agent A");
+    const agentB = await insertAgent(companyId, "Legacy Self-refill Agent B");
+    adapterGate = new Promise<void>((resolve) => {
+      releaseHeldRun = resolve;
+    });
+    await insertRun(companyId, agentB, "queued");
+    await fairnessOff.resumeQueuedRuns();
+    await vi.waitFor(() => {
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    });
+
+    const queuedOldA = await insertRun(companyId, agentA, "queued", 3_600_000);
+    const queuedNewB = await insertRun(companyId, agentB, "queued", 60_000);
+
+    adapterGate = null;
+    releaseHeldRun();
+    await fairnessOff.drainActiveRunExecutions();
+
+    // Kill switch restores legacy behavior: B's self-refill claims the freed
+    // slot even though A's run is strictly older.
+    expect(await runStatus(queuedNewB)).toMatchObject({ status: "succeeded" });
+    expect(await runStatus(queuedOldA)).toMatchObject({ status: "queued" });
   });
 });
