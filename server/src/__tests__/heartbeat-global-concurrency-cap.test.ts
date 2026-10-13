@@ -8,6 +8,8 @@ import {
   createDb,
   heartbeatRuns,
   issues,
+  issueComments,
+  issueRelations,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -107,6 +109,7 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
 
   afterEach(async () => {
     adapterGate = null;
+    releaseHeldRun();
     releaseHeldRun = () => {};
     await heartbeat.drainActiveRunExecutions();
     mockAdapterExecute.mockClear();
@@ -380,6 +383,143 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     expect(await runStatus(queuedOldA)).toMatchObject({ status: "succeeded" });
     expect(await runStatus(queuedNewB)).toMatchObject({ status: "queued" });
     expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["unresolved user", "invalid recovery admission", "unresolved recovery proof"])(
+    "does not reserve cap=1 indefinitely for an older run with %s",
+    async (rejection) => {
+      const companyId = await insertCompany();
+      const agentA = await insertAgent(companyId, "Deferred Agent A");
+      const agentB = await insertAgent(companyId, "Healthy Agent B");
+      let issueId: string | undefined;
+      if (rejection !== "unresolved user") {
+        issueId = randomUUID();
+        await db.insert(issues).values({
+          id: issueId, companyId, title: "Deferred recovery", status: "todo",
+          assigneeAgentId: agentA, responsibleUserId: "board-user",
+        });
+      }
+      const deferred = await insertRun(companyId, agentA, "queued", 3_600_000, issueId);
+      await db.update(agentWakeupRequests).set({
+        source: "automation", triggerDetail: "system",
+        requestedByActorType: "system", requestedByActorId: null,
+        reason: "issue_continuation_needed", payload: {},
+      }).where(sql`${agentWakeupRequests.runId} = ${deferred}`);
+      await db.update(heartbeatRuns).set({
+        invocationSource: "automation", triggerDetail: "system",
+        ...(rejection === "invalid recovery admission"
+          ? { runnerProfileJson: { chatControlRecoveryAdmission: { phase: "invalid" } } }
+          : {}),
+      }).where(sql`${heartbeatRuns.id} = ${deferred}`);
+
+      // Repeat with new healthy work each sweep: the older run remains queued,
+      // but must never reserve the only slot while its admission is deferred.
+      for (let sweep = 0; sweep < 2; sweep++) {
+        const healthy = await insertRun(companyId, agentB, "queued", 60_000);
+        adapterGate = new Promise<void>((resolve) => { releaseHeldRun = resolve; });
+        await heartbeat.resumeQueuedRuns();
+        expect(await runStatus(deferred)).toMatchObject({ status: "queued" });
+        expect(await runStatus(healthy)).toMatchObject({ status: "running" });
+        adapterGate = null;
+        releaseHeldRun();
+        await heartbeat.drainActiveRunExecutions();
+        expect(await runStatus(healthy)).toMatchObject({ status: "succeeded" });
+      }
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("scans past a saturated agent's 25 older rows before allowing cap=2 self-refill", async () => {
+    const capTwo = heartbeatService(db, {
+      runtimeEnv: { HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS: "2" },
+    });
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Older Runnable Agent A");
+    const agentB = await insertAgent(companyId, "Self-refill Agent B");
+    const agentC = await insertAgent(companyId, "Saturated Agent C");
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { enabled: true, maxConcurrentRuns: 1 } },
+    }).where(sql`${agents.id} = ${agentC}`);
+    await insertRun(companyId, agentC, "running");
+    adapterGate = new Promise<void>((resolve) => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await capTwo.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    for (let i = 0; i < 26; i++) await insertRun(companyId, agentC, "queued", 7_200_000);
+    // Tied timestamps with sub-millisecond precision exercise the page cursor.
+    await db.update(heartbeatRuns).set({
+      createdAt: sql`date_trunc('milliseconds', now() - interval '2 hours') + interval '123 microseconds'`,
+    }).where(sql`${heartbeatRuns.agentId} = ${agentC} and ${heartbeatRuns.status} = 'queued'`);
+    const olderA = await insertRun(companyId, agentA, "queued", 3_600_000);
+    const youngerB = await insertRun(companyId, agentB, "queued", 60_000);
+    adapterGate = null;
+    releaseHeldRun();
+    await capTwo.drainActiveRunExecutions();
+    expect(await runStatus(youngerB)).toMatchObject({ status: "queued" });
+
+    adapterGate = new Promise<void>((resolve) => { releaseHeldRun = resolve; });
+    try {
+      await capTwo.resumeQueuedRuns();
+      expect(await runStatus(olderA)).toMatchObject({ status: "running" });
+      expect(await runStatus(youngerB)).toMatchObject({ status: "queued" });
+      const queuedC = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.agentId} = ${agentC} and ${heartbeatRuns.status} = 'queued'`);
+      expect(queuedC).toHaveLength(26);
+    } finally {
+      adapterGate = null;
+      releaseHeldRun();
+      await capTwo.drainActiveRunExecutions();
+    }
+  });
+
+  it("reserves for an older permitted comment wake on a dependency-blocked issue", async () => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Comment Agent A");
+    const agentB = await insertAgent(companyId, "Self-refill Agent B");
+    adapterGate = new Promise<void>((resolve) => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const blockerId = randomUUID();
+    const issueId = randomUUID();
+    const commentId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Unresolved blocker", status: "todo" },
+      { id: issueId, companyId, title: "Blocked issue", status: "todo",
+        assigneeAgentId: agentA, responsibleUserId: "board-user" },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks",
+    });
+    await db.insert(issueComments).values({
+      id: commentId, companyId, issueId, authorType: "user",
+      authorUserId: "board-user", body: "Explain the blocker.",
+    });
+    const olderA = await insertRun(companyId, agentA, "queued", 3_600_000, issueId);
+    await db.update(heartbeatRuns).set({
+      invocationSource: "automation", triggerDetail: "system",
+      contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: commentId },
+    }).where(sql`${heartbeatRuns.id} = ${olderA}`);
+    await db.update(agentWakeupRequests).set({
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId, commentId },
+    }).where(sql`${agentWakeupRequests.runId} = ${olderA}`);
+    const youngerB = await insertRun(companyId, agentB, "queued", 60_000);
+
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(youngerB)).toMatchObject({ status: "queued" });
+    adapterGate = new Promise<void>((resolve) => { releaseHeldRun = resolve; });
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(olderA)).toMatchObject({ status: "running" });
+    expect(await runStatus(youngerB)).toMatchObject({ status: "queued" });
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(olderA)).toMatchObject({ status: "succeeded" });
   });
 
   it("keeps first-come-first-served self-refill when HEARTBEAT_GLOBAL_CLAIM_FAIRNESS=off", async () => {
