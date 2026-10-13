@@ -72,6 +72,7 @@ const apiPrefixes: Record<string, string> = {
   "status-cards.ts": "/api",
   "teams-catalog.ts": "/api",
   "token-usage.ts": "/api",
+  "goal-progress.ts": "/api",
   "tool-access.ts": "/api",
   "tool-gateway.ts": "/api",
   "user-profiles.ts": "/api",

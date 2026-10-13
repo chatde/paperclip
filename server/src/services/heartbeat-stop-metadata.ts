@@ -131,3 +131,31 @@ export function mergeHeartbeatRunStopMetadata(
     ...(metadata.effectiveTimeoutMs != null ? { effectiveTimeoutMs: metadata.effectiveTimeoutMs } : {}),
   };
 }
+
+/**
+ * Classified operator-facing reason for a run that settled on its time budget.
+ *
+ * A timeout SIGINT makes agent CLIs die mid-turn with a raw traceback head
+ * (e.g. "Traceback (most recent call last):") that would otherwise land
+ * verbatim in `agents.errorReason` and run error rows. When the run settles
+ * `timed_out` / `errorCode=timeout` (per resultJson `timeoutFired` /
+ * `effectiveTimeoutSec`), store a classified reason instead — no traceback
+ * text. Returns null for non-timeout settlements so genuine crashes keep
+ * their real error line (TOP-396).
+ */
+export function classifyRunTimeoutErrorReason(input: {
+  outcome: HeartbeatRunOutcome;
+  errorCode?: string | null;
+  timeoutFired?: boolean | null;
+  effectiveTimeoutSec?: number | null;
+}): string | null {
+  const timeoutSettled =
+    input.outcome === "timed_out" ||
+    input.timeoutFired === true ||
+    input.errorCode === "timeout";
+  if (!timeoutSettled) return null;
+  const sec = input.effectiveTimeoutSec;
+  return typeof sec === "number" && Number.isFinite(sec) && sec > 0
+    ? `timed out after ${Math.floor(sec)}s (run budget exceeded)`
+    : "timed out (run budget exceeded)";
+}

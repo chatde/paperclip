@@ -873,6 +873,41 @@ describe("Agents", () => {
     expect(container.textContent).toContain("acme_sandbox sandbox provider");
   });
 
+  it.each([
+    ["streamlined", Agents, "Agent view"],
+    ["production", ProductionAgents, "View mode"],
+  ])("groups agents by provider and model on the By model tab (%s page) and hides the chart toggle", async (_name, Page, toggleLabel) => {
+    mockRouterState.pathname = "/agents/bymodel";
+    mockAgentsApi.list.mockResolvedValue([
+      makeAgent({ id: "agent-1", name: "Alpha", adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" } }),
+      makeAgent({ id: "agent-2", name: "Bravo", adapterType: "hermes_local", adapterConfig: { provider: "xiaomi", model: "mimo-v2.6-pro" } }),
+      makeAgent({ id: "agent-3", name: "Charlie", adapterType: "hermes_local", adapterConfig: { provider: "xiaomi", model: "mimo-v2.6-pro" } }),
+    ]);
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(
+        <QueryClientProvider client={queryClient}>
+          <ToastProvider>
+            <Page />
+          </ToastProvider>
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const grouped = container.querySelector('[data-testid="agents-by-model"]');
+    expect(grouped).not.toBeNull();
+    const sections = [...grouped!.querySelectorAll("section")].map((section) => section.getAttribute("aria-label"));
+    expect(sections).toEqual(["MiMo", "Codex"]);
+    expect(grouped!.textContent).toContain("mimo-v2.6-pro");
+    expect(grouped!.textContent).toContain("Bravo");
+    expect(grouped!.textContent).toContain("Charlie");
+    expect(grouped!.textContent).toContain("Alpha");
+    // The grouped list is the only presentation for this tab: no org-chart toggle.
+    expect(container.querySelector(`[aria-label="${toggleLabel}"]`)).toBeNull();
+  });
+
   it("does not show environment filter or grouping controls yet", async () => {
     root = createRoot(container);
     await act(async () => {

@@ -2832,3 +2832,4 @@ export * from "./types/skill-source.js";
 export * from "./validators/skill-source.js";
 export * from "./github-skill-repository.js";
 export type { TokenUsageWindow, TokenUsageModel, TokenUsageProvider, TokenUsageSummary, TokenUsageResponse } from "./types/token-usage.js";
+export type { GoalProgressStage, GoalProgressCounts, GoalProgressGoal, GoalProgressAgent, GoalProgressResponse } from "./types/goal-progress.js";

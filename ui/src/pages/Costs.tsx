@@ -569,7 +569,7 @@ export function Costs({
                 <h1 className="text-3xl font-semibold tracking-tight">Costs</h1>
               )}
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
-                Inference spend, platform fees, credits, and live quota windows.
+                Estimated AI usage value (flat-rate plans: not a bill), platform fees, credits, and live quota windows.
               </p>
             </div>
 
@@ -608,7 +608,7 @@ export function Costs({
 
           <div className="grid gap-3 lg:grid-cols-4">
             <MetricTile
-              label="Inference spend"
+              label="AI usage value (est.)"
               value={formatCents(spendData?.summary.spendCents ?? 0)}
               subtitle={`${formatTokens(inferenceTokenTotal)} tokens across request-scoped events`}
               icon={DollarSign}
@@ -701,7 +701,7 @@ export function Costs({
                         <div className="mt-1 text-sm text-muted-foreground">
                           {spendData?.summary.budgetCents && spendData.summary.budgetCents > 0
                             ? `Budget ${formatCents(spendData.summary.budgetCents)}`
-                            : "Unlimited budget"}
+                            : "No spending limit set"}
                         </div>
                       </div>
                       <div className="border border-border px-4 py-3 text-right">

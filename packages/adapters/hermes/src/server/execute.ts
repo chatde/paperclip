@@ -321,7 +321,18 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
       .filter((line) => /error|exception|traceback|failed/i.test(line))
       .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
     if (errorLines.length > 0) {
-      result.errorMessage = errorLines.slice(0, 5).join("\n");
+      // TOP-396: prefer the last matching line over the bare
+      // "Traceback (most recent call last):" header when there is more than
+      // one match — the header alone is not a reason, while the last matching
+      // line is the actual exception. Keep the header only when it is the
+      // sole match (genuine non-timeout crash where it is all we have).
+      const bareTracebackHeader = /^\s*Traceback \(most recent call last\):\s*$/;
+      if (errorLines.length > 1) {
+        const nonHeader = errorLines.filter((line) => !bareTracebackHeader.test(line));
+        result.errorMessage = nonHeader.at(-1) ?? errorLines.at(-1) ?? errorLines[0] ?? "";
+      } else {
+        result.errorMessage = errorLines.slice(0, 5).join("\n");
+      }
     }
   }
 
@@ -591,9 +602,17 @@ export async function execute(
     model,
   };
 
-  if (parsed.errorMessage) {
+  // TOP-396: never surface parsed traceback text for a timeout settle. A
+  // timeout SIGINT makes hermes raise KeyboardInterrupt mid cli.chat(), and
+  // its traceback contributes only the bare "Traceback (most recent call
+  // last):" header to stderr error matching. Timeout diagnostics stay with
+  // the heartbeat timeout path, which stores the classified "timed out after
+  // Ns (run budget exceeded)" reason instead of a raw traceback head.
+  if (result.timedOut) {
+    // Intentionally leave errorMessage unset.
+  } else if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
-  } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
+  } else if (typeof result.exitCode === "number" && result.exitCode !== 0) {
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
   }
 

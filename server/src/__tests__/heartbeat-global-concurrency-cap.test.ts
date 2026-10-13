@@ -289,6 +289,22 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     expect(await runStatus(queuedModel)).toMatchObject({ status: "queued" });
   });
 
+  it("never defers the grok_local oversight seat behind the fleet-wide cap", async () => {
+    const companyId = await insertCompany();
+    const modelAgent = await insertAgent(companyId, "Model Agent");
+    const auditor = await insertAgent(companyId, "Chief Audit Officer", "grok_local");
+    const otherModelAgent = await insertAgent(companyId, "Other Model Agent");
+    await insertRun(companyId, modelAgent, "running");
+    const queuedAuditor = await insertRun(companyId, auditor, "queued");
+    const queuedModel = await insertRun(companyId, otherModelAgent, "queued");
+
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    expect(await runStatus(queuedAuditor)).toMatchObject({ status: "succeeded" });
+    expect(await runStatus(queuedModel)).toMatchObject({ status: "queued" });
+  });
+
   it("does not defer queued runs when the fleet-wide cap is disabled", async () => {
     const uncapped = heartbeatService(db);
     const companyId = await insertCompany();

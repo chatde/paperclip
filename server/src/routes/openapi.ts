@@ -2012,6 +2012,20 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/companies/{companyId}/goal-progress",
+  tags: ["companies"],
+  summary: "Get goal progress",
+  description: "Progress toward every goal: done/total task counts rolled up the goal tree, a 0-100 percent per goal (milestones weighted equally under their parent), each agent's current open task with its goal and stage, and the number of open tasks with no goal.",
+  request: { params: z.object({ companyId: z.string() }) },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/companies/{companyId}/token-usage",
   tags: ["companies"],
   summary: "Get machine AI token usage",

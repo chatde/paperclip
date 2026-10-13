@@ -358,6 +358,7 @@ import {
 } from "./heartbeat-run-summary.js";
 import {
   buildHeartbeatRunStopMetadata,
+  classifyRunTimeoutErrorReason,
   mergeHeartbeatRunStopMetadata,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
@@ -683,6 +684,8 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 // values disable the cap so existing deployments keep their behavior.
 export const HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_ENV =
   "HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS";
+const FLEET_CAP_EXEMPT_ADAPTERS = new Set(["process", "grok_local"]);
+
 export function parseGlobalMaxConcurrentRuns(
   raw: string | number | undefined | null,
 ): number | null {
@@ -20144,6 +20147,9 @@ export function heartbeatService(
       evaluatedAgentIds.add(run.agentId);
       const agentRow = await getAgent(run.agentId);
       if (!agentRow) continue;
+      // Cap-exempt adapters (process scripts, the Grok oversight seat) never wait on the
+      // fleet-wide ceiling, so their queued runs must not reserve ceiling slots either.
+      if (FLEET_CAP_EXEMPT_ADAPTERS.has(agentRow.adapterType)) continue;
       const policy = parseHeartbeatPolicy(agentRow);
       const running = await countRunningRunsForAgent(run.agentId);
       if (running >= policy.maxConcurrentRuns) continue;
@@ -20304,9 +20310,11 @@ export function heartbeatService(
         runtimeEnv[HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS_ENV],
       );
       // `process` agents (e.g. the job router) run a short local script, not a model session, so they never
-      // wait behind the fleet-wide model-run ceiling; their per-agent limit still applies.
+      // wait behind the fleet-wide model-run ceiling; their per-agent limit still applies. `grok_local` is the
+      // oversight seat (Chief Audit Officer): one agent on the owner's subscription that must not sit behind the
+      // workforce it audits.
       let globalRunningCount: number | null = null;
-      if (globalMaxConcurrentRuns !== null && availableSlots > 0 && agent.adapterType !== "process") {
+      if (globalMaxConcurrentRuns !== null && availableSlots > 0 && !FLEET_CAP_EXEMPT_ADAPTERS.has(agent.adapterType)) {
         globalRunningCount = await countRunningRuns();
         availableSlots = Math.min(
           availableSlots,
@@ -20408,21 +20416,14 @@ export function heartbeatService(
           : true;
         const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
         const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
-        const leftRank = leftIssueId
-          ? leftReady
-            ? leftIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        const rightRank = rightIssueId
-          ? rightReady
-            ? rightIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        if (leftRank !== rightRank) return leftRank - rightRank;
+        // Dependency-blocked runs must never dispatch ahead of ready runs, so
+        // they sort last. Among ready runs (in_progress, ready-todo, or no
+        // issue) dispatch is oldest-first within priority: age dominates so a
+        // long-queued run is not starved by a freshly created in_progress run
+        // when fleet-wide concurrency slots are scarce (TOP-417).
+        const leftBlocked = !leftReady;
+        const rightBlocked = !rightReady;
+        if (leftBlocked !== rightBlocked) return leftBlocked ? 1 : -1;
         const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
         const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
         if (leftPriorityRank !== rightPriorityRank)
@@ -20437,7 +20438,7 @@ export function heartbeatService(
       const claimFairnessActive =
         globalMaxConcurrentRuns !== null &&
         globalRunningCount !== null &&
-        agent.adapterType !== "process" &&
+        !FLEET_CAP_EXEMPT_ADAPTERS.has(agent.adapterType) &&
         !parseGlobalClaimFairnessDisabled(
           runtimeEnv[HEARTBEAT_GLOBAL_CLAIM_FAIRNESS_ENV],
         );
@@ -25659,13 +25660,32 @@ export function heartbeatService(
           usageBasis: adapterResult.usageBasis ?? null,
         });
         const normalizedUsage = sessionUsageResolution.normalizedUsage;
+        // TOP-396: a run that settled on its time budget stores a classified
+        // reason ("timed out after Ns (run budget exceeded)") instead of the
+        // raw traceback head a timeout SIGINT leaves in the adapter's parsed
+        // stderr (e.g. "Traceback (most recent call last):"). Genuine
+        // non-timeout crashes keep their real error line.
+        const stopMetadataForError = buildHeartbeatRunStopMetadata({
+          adapterType: agent.adapterType,
+          adapterConfig: parseObject(agent.adapterConfig),
+          outcome,
+          errorCode: adapterResult.errorCode ?? latestRun?.errorCode ?? null,
+          errorMessage: adapterResult.errorMessage ?? null,
+        });
+        const timeoutErrorReason = classifyRunTimeoutErrorReason({
+          outcome,
+          errorCode: adapterResult.errorCode ?? latestRun?.errorCode ?? null,
+          timeoutFired: stopMetadataForError.timeoutFired,
+          effectiveTimeoutSec: stopMetadataForError.effectiveTimeoutSec,
+        });
         const runErrorMessage =
           outcome === "cancelled"
             ? (latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled")
             : outcome === "succeeded"
               ? null
               : redactCurrentUserText(
-                  adapterResult.errorMessage ??
+                  timeoutErrorReason ??
+                    adapterResult.errorMessage ??
                     (outcome === "timed_out" ? "Timed out" : "Adapter failed"),
                   currentUserRedactionOptions,
                 );

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildHeartbeatRunStopMetadata,
+  classifyRunTimeoutErrorReason,
   mergeHeartbeatRunStopMetadata,
   resolveHeartbeatRunTimeoutPolicy,
 } from "./heartbeat-stop-metadata.js";
@@ -128,5 +129,66 @@ describe("heartbeat stop metadata", () => {
       timeoutSource: "default",
       timeoutFired: false,
     });
+  });
+});
+
+describe("classifyRunTimeoutErrorReason (TOP-396)", () => {
+  it("classifies a timed_out settle using the effective timeout budget", () => {
+    expect(
+      classifyRunTimeoutErrorReason({
+        outcome: "timed_out",
+        timeoutFired: true,
+        effectiveTimeoutSec: 180,
+      }),
+    ).toBe("timed out after 180s (run budget exceeded)");
+  });
+
+  it("classifies an errorCode=timeout settle even when the outcome is failed", () => {
+    expect(
+      classifyRunTimeoutErrorReason({
+        outcome: "failed",
+        errorCode: "timeout",
+        timeoutFired: false,
+        effectiveTimeoutSec: 45,
+      }),
+    ).toBe("timed out after 45s (run budget exceeded)");
+  });
+
+  it("classifies from resultJson timeoutFired alone", () => {
+    expect(
+      classifyRunTimeoutErrorReason({
+        outcome: "failed",
+        timeoutFired: true,
+        effectiveTimeoutSec: 60,
+      }),
+    ).toBe("timed out after 60s (run budget exceeded)");
+  });
+
+  it("degrades gracefully when no timeout duration is known", () => {
+    expect(classifyRunTimeoutErrorReason({ outcome: "timed_out" })).toBe(
+      "timed out (run budget exceeded)",
+    );
+    expect(
+      classifyRunTimeoutErrorReason({
+        outcome: "timed_out",
+        effectiveTimeoutSec: 0,
+      }),
+    ).toBe("timed out (run budget exceeded)");
+  });
+
+  it("returns null for non-timeout settlements so real crash errors survive", () => {
+    expect(
+      classifyRunTimeoutErrorReason({
+        outcome: "failed",
+        errorCode: "adapter_failed",
+        timeoutFired: false,
+        effectiveTimeoutSec: 180,
+      }),
+    ).toBeNull();
+    expect(classifyRunTimeoutErrorReason({ outcome: "succeeded" })).toBeNull();
+    expect(classifyRunTimeoutErrorReason({ outcome: "cancelled" })).toBeNull();
+    expect(
+      classifyRunTimeoutErrorReason({ outcome: "interrupted" }),
+    ).toBeNull();
   });
 });

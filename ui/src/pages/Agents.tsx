@@ -26,6 +26,7 @@ import { OrgChart } from "./OrgChart";
 import { relativeTime, cn, agentRouteRef, agentUrl } from "../lib/utils";
 import { PageTabBar } from "../components/PageTabBar";
 import { Tabs } from "@/components/ui/tabs";
+import { groupAgentsByModel } from "@/lib/agentModelGroups";
 import { Button } from "@/components/ui/button";
 import { AlertTriangle, Bot, Plus, List, Network } from "lucide-react";
 import { AGENT_ROLE_LABELS, type Agent, type Environment, type EnvironmentCapabilities } from "@paperclipai/shared";
@@ -49,7 +50,7 @@ const ConfigureBuiltInAgentModal = lazy(() =>
   })),
 );
 
-export const AGENT_FILTER_TABS = ["all", "active", "paused", "error", "builtin"] as const;
+export const AGENT_FILTER_TABS = ["all", "active", "paused", "error", "bymodel", "builtin"] as const;
 type FilterTab = (typeof AGENT_FILTER_TABS)[number];
 
 const AGENT_FILTER_TAB_ITEMS: { value: FilterTab; label: string }[] = [
@@ -57,6 +58,7 @@ const AGENT_FILTER_TAB_ITEMS: { value: FilterTab; label: string }[] = [
   { value: "active", label: "Active" },
   { value: "paused", label: "Paused" },
   { value: "error", label: "Error" },
+  { value: "bymodel", label: "By model" },
   { value: "builtin", label: "Built-in" },
 ];
 
@@ -88,7 +90,7 @@ const loadingEnvironmentDescriptor: EnvironmentDescriptor = {
 const HIDDEN_AGENT_STATUSES = new Set(["terminated", "pending_approval"]);
 
 function matchesFilter(status: string, tab: FilterTab): boolean {
-  if (tab === "all") return true;
+  if (tab === "all" || tab === "bymodel") return true;
   if (tab === "active") return status === "active" || status === "running" || status === "idle";
   if (tab === "paused") return status === "paused";
   if (tab === "error") return status === "error";
@@ -206,7 +208,8 @@ export function Agents({ initialView = "list" }: { initialView?: AgentsView } = 
   const requestedTab: FilterTab = isFilterTab(pathSegment) ? pathSegment : "all";
   const [view, setView] = useState<AgentsView>(() => streamlinedUiEnabled ? initialView : "org");
   const forceListView = !streamlinedUiEnabled && isMobile;
-  const effectiveView: AgentsView = forceListView ? "list" : view;
+  // "By model" is a grouped list; the org chart cannot show it.
+  const effectiveView: AgentsView = forceListView || requestedTab === "bymodel" ? "list" : view;
 
   useEffect(() => {
     setView(streamlinedUiEnabled ? initialView : "org");
@@ -492,7 +495,7 @@ export function Agents({ initialView = "list" }: { initialView?: AgentsView } = 
           />
         </Tabs>
         <div className="flex items-center gap-2">
-          {!forceListView ? <div className="flex items-center overflow-hidden rounded-md border border-border" role="group" aria-label="Agent view">
+          {!forceListView && tab !== "bymodel" ? <div className="flex items-center overflow-hidden rounded-md border border-border" role="group" aria-label="Agent view">
               <Button
                 type="button"
                 size="icon-sm"
@@ -541,9 +544,32 @@ export function Agents({ initialView = "list" }: { initialView?: AgentsView } = 
       )}
 
       {/* List view */}
-      {effectiveView === "list" && filtered.length > 0 && (
+      {effectiveView === "list" && filtered.length > 0 && tab !== "bymodel" && (
         <div>
           {filtered.map(renderAgentRow)}
+        </div>
+      )}
+
+      {/* By model: every agent under the AI provider and model it runs on */}
+      {effectiveView === "list" && filtered.length > 0 && tab === "bymodel" && (
+        <div className="space-y-6" data-testid="agents-by-model">
+          {groupAgentsByModel(filtered).map((group) => (
+            <section key={group.provider} aria-label={group.provider}>
+              <h2 className="mb-2 flex items-baseline gap-2 text-sm font-semibold">
+                {group.provider}
+                <span className="font-normal text-muted-foreground">{group.count} {group.count === 1 ? "agent" : "agents"}</span>
+              </h2>
+              {group.models.map((entry) => (
+                <div key={entry.model} className="mb-3">
+                  <h3 className="mb-1 flex items-baseline gap-2 pl-2 text-xs font-medium text-muted-foreground">
+                    <span className="break-all">{entry.model}</span>
+                    <span>{entry.agents.length}</span>
+                  </h3>
+                  <div>{entry.agents.map(renderAgentRow)}</div>
+                </div>
+              ))}
+            </section>
+          ))}
         </div>
       )}
 

@@ -93,6 +93,7 @@ import { smokeLabRoutes } from "./routes/smoke-lab.js";
 import { costRoutes } from "./routes/costs.js";
 import { activityRoutes } from "./routes/activity.js";
 import { tokenUsageRoutes } from "./routes/token-usage.js";
+import { goalProgressRoutes } from "./routes/goal-progress.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { attentionRoutes } from "./routes/attention.js";
 import { decisionTrainingRoutes } from "./routes/decision-training.js";
@@ -799,6 +800,7 @@ export async function createApp(
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(tokenUsageRoutes());
+  api.use(goalProgressRoutes(db));
   api.use(attentionRoutes(db));
   api.use(decisionTrainingRoutes(db));
   api.use(decisionRoutes(db, opts.decisionServiceOptions));

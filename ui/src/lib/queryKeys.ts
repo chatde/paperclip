@@ -553,6 +553,7 @@ export const queryKeys = {
   goals: {
     list: (companyId: string) => ["goals", companyId] as const,
     detail: (id: string) => ["goals", "detail", id] as const,
+    progress: (companyId: string) => ["goals", "progress", companyId] as const,
   },
   artifacts: {
     list: (

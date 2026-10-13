@@ -109,11 +109,18 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
+    // A persisted run bound to this agent and company is a valid run context
+    // even without a source issue: scheduled/standing wakes and manual unassigned
+    // wakes (e.g. `paperclip-run-unassigned-*`) carry no issue id by design.
+    // The spec only counts writes to the run's own source issue as free, so a
+    // run without a source issue has no free lane: every write it makes is a
+    // counted cross-issue write. Missing, invalid, or mismatched runs still
+    // fail closed above.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }

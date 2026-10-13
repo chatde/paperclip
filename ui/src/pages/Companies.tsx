@@ -280,7 +280,7 @@ export function Companies() {
                     {formatCents(company.spentMonthlyCents)}
                     {company.budgetMonthlyCents > 0
                       ? <> / {formatCents(company.budgetMonthlyCents)} <span className="text-xs">({budgetPct}%)</span></>
-                      : <span className="text-xs ml-1">Unlimited budget</span>}
+                      : <span className="text-xs ml-1">No spending limit set</span>}
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5 ml-auto">

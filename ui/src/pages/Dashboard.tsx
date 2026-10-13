@@ -38,6 +38,7 @@ import { InlineBanner } from "../components/InlineBanner";
 import type { Agent, Issue } from "@paperclipai/shared";
 import { PluginSlotOutlet } from "@/plugins/slots";
 import { TokenUsage } from "../components/TokenUsage";
+import { GoalProgress } from "../components/GoalProgress";
 import { SmokeLabDashboardCard } from "../components/SmokeLabDashboardCard";
 
 const DASHBOARD_ACTIVITY_LIMIT = 10;
@@ -427,30 +428,32 @@ export function Dashboard() {
             <MetricCard
               icon={DollarSign}
               value={formatCents(data.costs.monthSpendCents)}
-              label="Month Spend"
+              label="AI usage this month (est.)"
               to="/costs"
               description={
                 <span>
                   {data.costs.monthBudgetCents > 0
-                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
-                    : "Unlimited budget"}
+                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} limit · estimate, not a bill`
+                    : "Estimated value on flat-rate plans, not a bill"}
                 </span>
               }
             />
             <MetricCard
               icon={ShieldCheck}
               value={data.pendingApprovals + data.budgets.pendingApprovals}
-              label="Pending Approvals"
+              label="Hires & approvals waiting"
               to="/approvals"
               description={
                 <span>
                   {data.budgets.pendingApprovals > 0
-                    ? `${data.budgets.pendingApprovals} budget overrides awaiting board review`
-                    : "Awaiting board review"}
+                    ? `${data.budgets.pendingApprovals} budget requests waiting`
+                    : "Owner questions are on the Decisions page"}
                 </span>
               }
             />
           </div>
+
+          <GoalProgress companyId={selectedCompanyId} />
 
           <TokenUsage companyId={selectedCompanyId} />
 
