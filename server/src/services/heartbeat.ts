@@ -714,14 +714,16 @@ export function parseGlobalClaimFairnessDisabled(
     normalized === "disabled"
   );
 }
-// How many strictly-older cross-agent queued runs a single fairness decision
-// examines. Beyond this bound the reservation is approximate; the periodic
-// sweep re-drives the backlog every tick, so approximation costs latency at
-// worst, never liveness.
+// Page size for the keyset scan. Rejected rows never truncate the older backlog.
 const CROSS_AGENT_FAIRNESS_LOOKBACK = 25;
 // A no-claim exit whose agent backlog is older than this is starvation-shaped
 // and deserves info-level visibility; younger backlogs log at debug.
 const STARVING_NO_CLAIM_LOG_AGE_MS = 10 * 60_000;
+const NO_CLAIM_INFO_INTERVAL_MS = 5 * 60_000;
+const CLAIM_DEFERRAL_RETENTION_MS = 5 * 60_000;
+type QueuedRunIdentity = Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "agentId" | "contextSnapshot" | "wakeupRequestId" |
+  "responsibleUserId" | "invocationSource" | "triggerDetail">;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -11106,7 +11108,7 @@ export function heartbeatService(
   }
 
   async function resolveResponsibleUserIdForRun(input: {
-    run: typeof heartbeatRuns.$inferSelect;
+    run: QueuedRunIdentity;
     contextSnapshot: Record<string, unknown>;
     issueContext: Awaited<ReturnType<typeof getIssueExecutionContext>> | null;
     routineEnvContext: Awaited<
@@ -17353,7 +17355,7 @@ export function heartbeatService(
   // Shared identity resolution for admission and the read-only fairness mirror.
   // The resolver only mutates this local context, never the persisted run.
   async function resolveQueuedRunResponsibleUserId(
-    run: typeof heartbeatRuns.$inferSelect,
+    run: QueuedRunIdentity,
     context: Record<string, unknown>,
   ) {
     const issueId = readNonEmptyString(context.issueId);
@@ -17371,7 +17373,55 @@ export function heartbeatService(
     });
   }
 
+  // Advisory cache only: actual admission always retries, even while a marker
+  // suppresses reservations. Bound memory and expire markers for deleted runs.
+  const queuedClaimDeferrals = new Map<string, { reason: string; at: number }>();
+  const noClaimInfoAt = new Map<string, number>();
+
+  function rememberQueuedClaimDeferral(runId: string, reason: string) {
+    queuedClaimDeferrals.delete(runId);
+    queuedClaimDeferrals.set(runId, { reason, at: Date.now() });
+    if (queuedClaimDeferrals.size > 10_000) {
+      queuedClaimDeferrals.delete(queuedClaimDeferrals.keys().next().value!);
+    }
+  }
+
+  function queuedClaimDeferral(runId: string) {
+    const marker = queuedClaimDeferrals.get(runId);
+    if (marker && Date.now() - marker.at >= CLAIM_DEFERRAL_RETENTION_MS) {
+      queuedClaimDeferrals.delete(runId);
+      return undefined;
+    }
+    return marker;
+  }
+
   async function claimQueuedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    companyAgents?: AgentOrgRow[],
+  ) {
+    try {
+      const claimed = await attemptQueuedRunClaim(run, companyAgents);
+      if (claimed) {
+        queuedClaimDeferrals.delete(run.id);
+      } else {
+        const [current] = await db.select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        if (current?.status === "queued") {
+          rememberQueuedClaimDeferral(run.id, "admission_deferred");
+        } else {
+          queuedClaimDeferrals.delete(run.id);
+        }
+      }
+      return claimed;
+    } catch (err) {
+      if (isDeferrableClaimRejection(err) && err.status !== 403) {
+        rememberQueuedClaimDeferral(run.id, `http_${err.status}:${err.message}`);
+      }
+      throw err;
+    }
+  }
+
+  async function attemptQueuedRunClaim(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
   ) {
@@ -19732,7 +19782,11 @@ export function heartbeatService(
       );
 
     for (const { agentId } of queuedAgents) {
-      await startNextQueuedRunForAgent(agentId);
+      try {
+        await startNextQueuedRunForAgent(agentId);
+      } catch (err) {
+        logger.warn({ err, agentId }, "failed to resume agent's queued heartbeat runs");
+      }
     }
   }
 
@@ -20127,169 +20181,137 @@ export function heartbeatService(
   //    ~one sweep tick and never head-of-line blocks the fleet.
   // ---------------------------------------------------------------------------
   async function countOlderClaimableCrossAgentQueuedRuns(
-    candidate: { agentId: string; createdAt: Date },
+    candidate: { id: string; agentId: string; fairnessCreatedAt: string },
     globalRoom: number,
-  ): Promise<{ count: number; oldestCreatedAt: Date | null }> {
-    const cutoff = await getWorktreeExecutionCutoff();
+    cutoff: Date | null,
+  ): Promise<number> {
+    if (globalRoom <= 0) return 0;
     let count = 0;
-    let oldestCreatedAt: Date | null = null;
     let cursor: { id: string; createdAt: string } | null = null;
-    // Per-agent headroom and invokability for every distinct competitor agent.
-    const claimableAgentIds = new Set<string>();
+    const runningRows = await db.select({
+      agentId: heartbeatRuns.agentId, count: sql<number>`count(*)`,
+    }).from(heartbeatRuns).where(eq(heartbeatRuns.status, "running"))
+      .groupBy(heartbeatRuns.agentId);
+    const runningByAgent = new Map(runningRows.map(row => [row.agentId, Number(row.count)]));
+    const remainingByAgent = new Map<string, number>();
     const orgRowsByCompany = new Map<string, AgentOrgRow[]>();
-    const evaluatedAgentIds = new Set<string>();
-    // Lookback is a page size, not an eligibility cutoff: rejected/saturated
-    // rows must not hide older runnable work behind the first 25 entries.
+    const issueEligibility = new Map<string, {
+      executionRunId: string | null; checkoutRunId: string | null; dependencyBlocked: boolean;
+    }>();
+    // Lookback bounds each fetch, not eligibility: paginate past rejected rows.
     while (true) {
-      const older: Array<{
-        run: typeof heartbeatRuns.$inferSelect;
-        cursorCreatedAt: string;
-      }> = await db
-        .select({
-          run: heartbeatRuns,
-          // Preserve PostgreSQL microseconds across keyset pages.
-          cursorCreatedAt: sql<string>`${heartbeatRuns.createdAt}::text`,
-        })
-        .from(heartbeatRuns)
+      const older: Array<QueuedRunIdentity & Pick<typeof heartbeatRuns.$inferSelect,
+        "createdAt" | "runnerProfileJson" | "nativeIssueId"> & { cursorCreatedAt: string }> = await db.select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        companyId: heartbeatRuns.companyId,
+        createdAt: heartbeatRuns.createdAt,
+        cursorCreatedAt: sql<string>`${heartbeatRuns.createdAt}::text`,
+        invocationSource: heartbeatRuns.invocationSource,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        runnerProfileJson: heartbeatRuns.runnerProfileJson,
+        // Required by the shared identity and recovery admission resolvers.
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
+        triggerDetail: heartbeatRuns.triggerDetail,
+        nativeIssueId: heartbeatRuns.nativeIssueId,
+      }).from(heartbeatRuns)
         .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
-        .where(
-          and(
-            eq(heartbeatRuns.status, "queued"),
-            ne(heartbeatRuns.agentId, candidate.agentId),
-            lt(heartbeatRuns.createdAt, candidate.createdAt),
-            eq(companies.status, "active"),
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-            cursor
-              ? or(
-                  sql`${heartbeatRuns.createdAt} > ${cursor.createdAt}::timestamptz`,
-                  and(
-                    sql`${heartbeatRuns.createdAt} = ${cursor.createdAt}::timestamptz`,
-                    gt(heartbeatRuns.id, cursor.id),
-                  ),
-                )
-              : undefined,
+        .where(and(
+          eq(heartbeatRuns.status, "queued"),
+          ne(heartbeatRuns.agentId, candidate.agentId),
+          or(
+            sql`${heartbeatRuns.createdAt} < ${candidate.fairnessCreatedAt}::timestamptz`,
+            and(sql`${heartbeatRuns.createdAt} = ${candidate.fairnessCreatedAt}::timestamptz`,
+              lt(heartbeatRuns.id, candidate.id)),
           ),
-        )
+          eq(companies.status, "active"),
+          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+          cursor ? or(
+            sql`${heartbeatRuns.createdAt} > ${cursor.createdAt}::timestamptz`,
+            and(sql`${heartbeatRuns.createdAt} = ${cursor.createdAt}::timestamptz`,
+              gt(heartbeatRuns.id, cursor.id)),
+          ) : undefined,
+        ))
         .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
         .limit(CROSS_AGENT_FAIRNESS_LOOKBACK);
       if (older.length === 0) break;
+      const agentRows = await db.select().from(agents).where(inArray(
+        agents.id, [...new Set(older.map(run => run.agentId))],
+      ));
+      const agentById = new Map(agentRows.map(agent => [agent.id, agent]));
 
-      for (const { run } of older) {
-        if (evaluatedAgentIds.has(run.agentId)) continue;
-        evaluatedAgentIds.add(run.agentId);
-        const agentRow = await getAgent(run.agentId);
-        if (!agentRow) continue;
-        // Cap-exempt adapters (process scripts, the Grok oversight seat) never wait on the
-        // fleet-wide ceiling, so their queued runs must not reserve ceiling slots either.
-        if (FLEET_CAP_EXEMPT_ADAPTERS.has(agentRow.adapterType)) continue;
-        const policy = parseHeartbeatPolicy(agentRow);
-        const running = await countRunningRunsForAgent(run.agentId);
-        if (running >= policy.maxConcurrentRuns) continue;
-        let companyAgents = orgRowsByCompany.get(agentRow.companyId);
-        if (!companyAgents) {
-          companyAgents = await listCompanyAgentOrgRows(agentRow.companyId);
-          orgRowsByCompany.set(agentRow.companyId, companyAgents);
-        }
-        const invokability = evaluateAgentInvokability(
-          toAgentOrgRow(agentRow),
-          companyAgents,
-        );
-        if (!invokability.invokable) continue;
-        claimableAgentIds.add(run.agentId);
-      }
-
-      // Issue execution locks and dependency readiness per company. A run whose
-      // issue is executing/checked out is silently unclaimable right now
-      // (issueClaim.blocked), and a dependency-blocked run is cancelled at its
-      // claim attempt unless it permits an interaction wake.
-      const runsByCompany = new Map<
-        string,
-        Array<typeof heartbeatRuns.$inferSelect>
-      >();
-      for (const { run } of older) {
-        if (!claimableAgentIds.has(run.agentId)) continue;
-        const runs = runsByCompany.get(run.companyId) ?? [];
-        runs.push(run);
-        runsByCompany.set(run.companyId, runs);
-      }
-      const issueRowById = new Map<
-        string,
-        { executionRunId: string | null; checkoutRunId: string | null }
-      >();
-      const dependencyBlockedIssueIds = new Set<string>();
-      for (const [companyId, runs] of runsByCompany) {
-        const issueIds = [
-          ...new Set(
-            runs
-              .map((run) =>
-                readNonEmptyString(parseObject(run.contextSnapshot).issueId),
-              )
-              .filter((issueId): issueId is string => Boolean(issueId)),
-          ),
-        ];
-        if (issueIds.length === 0) continue;
-        const rows = await db
-          .select({
-            id: issues.id,
-            executionRunId: issues.executionRunId,
-            checkoutRunId: issues.checkoutRunId,
-          })
-          .from(issues)
-          .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)));
-        for (const row of rows) issueRowById.set(row.id, row);
-        const readiness = await listQueuedRunDependencyReadiness(companyId, runs);
-        for (const issueId of issueIds) {
-          if (readiness.get(issueId)?.isDependencyReady === false) {
-            dependencyBlockedIssueIds.add(issueId);
-          }
-        }
-      }
-
-      for (const { run } of older) {
-        if (!claimableAgentIds.has(run.agentId)) continue;
-        const context = { ...parseObject(run.contextSnapshot) };
-        const issueId = readNonEmptyString(context.issueId);
-        if (issueId) {
-          if (
-            dependencyBlockedIssueIds.has(issueId) &&
-            !allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS)
-          ) continue;
-          const issueRow = issueRowById.get(issueId);
-          if (
-            issueRow &&
-            (issueRow.executionRunId ||
-              (issueRow.checkoutRunId && issueRow.checkoutRunId !== run.id))
-          ) {
-            continue;
-          }
-        }
+      for (const run of older) {
+        if (queuedClaimDeferral(run.id)) continue;
         try {
+          if (!remainingByAgent.has(run.agentId)) {
+            const agent = agentById.get(run.agentId);
+            if (!agent || FLEET_CAP_EXEMPT_ADAPTERS.has(agent.adapterType)) {
+              remainingByAgent.set(run.agentId, 0);
+              continue;
+            }
+            const remaining = Math.max(0,
+              parseHeartbeatPolicy(agent).maxConcurrentRuns - (runningByAgent.get(agent.id) ?? 0));
+            if (remaining === 0) {
+              remainingByAgent.set(run.agentId, 0);
+              continue;
+            }
+            let companyAgents = orgRowsByCompany.get(agent.companyId);
+            if (!companyAgents) {
+              companyAgents = await listCompanyAgentOrgRows(agent.companyId);
+              orgRowsByCompany.set(agent.companyId, companyAgents);
+            }
+            remainingByAgent.set(run.agentId,
+              evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents).invokable ? remaining : 0);
+          }
+          const remaining = remainingByAgent.get(run.agentId) ?? 0;
+          if (remaining === 0) continue;
+          const context = { ...parseObject(run.contextSnapshot) };
+          const issueId = readNonEmptyString(context.issueId);
+          if (issueId) {
+            const key = `${run.companyId}:${issueId}`;
+            let eligibility = issueEligibility.get(key);
+            if (!eligibility) {
+              const [row] = await db.select({
+                executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
+              }).from(issues).where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)));
+              const readiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
+              eligibility = {
+                executionRunId: row?.executionRunId ?? null,
+                checkoutRunId: row?.checkoutRunId ?? null,
+                dependencyBlocked: readiness.get(issueId)?.isDependencyReady === false,
+              };
+              issueEligibility.set(key, eligibility);
+            }
+            if (eligibility.executionRunId ||
+                (eligibility.checkoutRunId && eligibility.checkoutRunId !== run.id) ||
+                (eligibility.dependencyBlocked &&
+                  !allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS))) continue;
+          }
           await resolveQueuedRunResponsibleUserId(run, context);
+          if (issueId && run.invocationSource === "automation") {
+            // Advisory reads only; claim repeats these under admission locks.
+            if (readChatControlRecoveryAdmission(run) === "invalid") continue;
+            const proof = await readChatControlRecoveryStop(db, {
+              companyId: run.companyId, issueId, agentId: run.agentId, sourceRunId: run.id,
+            });
+            if (proof.kind !== "clear") continue;
+          }
+          remainingByAgent.set(run.agentId, remaining - 1);
+          count += 1;
+          // Do not resolve identities/recovery for the rest of this page.
+          if (count >= globalRoom) return count;
         } catch (err) {
-          if (!isDeferrableClaimRejection(err)) throw err;
-          continue;
+          if (err instanceof TypeError || err instanceof ReferenceError) throw err;
+          logger.warn({ runId: run.id, errorClass: err instanceof Error ? err.name : typeof err },
+            "queued heartbeat fairness eligibility failed; skipping reservation");
         }
-        if (issueId && run.invocationSource === "automation") {
-          // Advisory reads only. The claim path repeats these checks under its
-          // admission locks before performing any state transition.
-          if (readChatControlRecoveryAdmission(run) === "invalid") continue;
-          const proof = await readChatControlRecoveryStop(db, {
-            companyId: run.companyId,
-            issueId,
-            agentId: run.agentId,
-            sourceRunId: run.id,
-          });
-          if (proof.kind !== "clear") continue;
-        }
-        count += 1;
-        if (!oldestCreatedAt) oldestCreatedAt = run.createdAt;
-        if (count >= globalRoom) return { count, oldestCreatedAt };
       }
       if (older.length < CROSS_AGENT_FAIRNESS_LOOKBACK) break;
       const last = older[older.length - 1];
-      cursor = { id: last.run.id, createdAt: last.cursorCreatedAt };
+      cursor = { id: last.id, createdAt: last.cursorCreatedAt };
     }
-    return { count, oldestCreatedAt };
+    return count;
   }
 
   // Bounded starvation visibility (TOP-387): every silent no-claim exit of
@@ -20298,22 +20320,13 @@ export function heartbeatService(
   // reason and the agent's oldest queued run age. Debug normally; info once
   // the backlog is old enough to be starvation-shaped. Agents with nothing
   // queued stay silent: there is nothing to claim and nothing to starve.
-  async function logStartNoClaim(
+  function logStartNoClaim(
     agentId: string,
+    oldest: { id: string; createdAt: Date } | undefined,
+    cutoff: Date | null,
     reason: string,
     detail: Record<string, unknown> = {},
   ) {
-    const [oldest] = await db
-      .select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.status, "queued"),
-        ),
-      )
-      .orderBy(asc(heartbeatRuns.createdAt))
-      .limit(1);
     if (!oldest) return;
     const oldestQueuedAgeMs = Date.now() - oldest.createdAt.getTime();
     const payload = {
@@ -20321,9 +20334,15 @@ export function heartbeatService(
       reason,
       oldestQueuedRunId: oldest.id,
       oldestQueuedAgeMs,
+      cutoffArmed: Boolean(cutoff),
       ...detail,
     };
-    if (oldestQueuedAgeMs >= STARVING_NO_CLAIM_LOG_AGE_MS) {
+    const now = Date.now();
+    if (oldestQueuedAgeMs >= STARVING_NO_CLAIM_LOG_AGE_MS &&
+        now - (noClaimInfoAt.get(agentId) ?? 0) >= NO_CLAIM_INFO_INTERVAL_MS) {
+      noClaimInfoAt.delete(agentId);
+      noClaimInfoAt.set(agentId, now);
+      if (noClaimInfoAt.size > 10_000) noClaimInfoAt.delete(noClaimInfoAt.keys().next().value!);
       logger.info(payload, "startNextQueuedRunForAgent: queued run not claimed");
     } else {
       logger.debug(payload, "startNextQueuedRunForAgent: queued run not claimed");
@@ -20331,11 +20350,17 @@ export function heartbeatService(
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
+    const cutoff = await getWorktreeExecutionCutoff();
+    const [oldest] = await db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
+    const logNoClaim = (reason: string, detail: Record<string, unknown> = {}) =>
+      logStartNoClaim(agentId, oldest, cutoff, reason, detail);
     if ((await getSchedulingSuppression()).suppressed) {
-      await logStartNoClaim(agentId, "suppression");
+      logNoClaim("suppression");
       return [];
     }
-    const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.
     const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
@@ -20351,7 +20376,7 @@ export function heartbeatService(
             `Cancelled because the agent is not invokable: ${invokability.reason}`,
           );
         }
-        await logStartNoClaim(agentId, "not_invokable", {
+        logNoClaim("not_invokable", {
           invokabilityReason: invokability.reason,
         });
         return [];
@@ -20388,8 +20413,7 @@ export function heartbeatService(
           globalRunningCount !== null &&
           globalMaxConcurrentRuns !== null &&
           globalRunningCount >= globalMaxConcurrentRuns;
-        await logStartNoClaim(
-          agentId,
+        logNoClaim(
           agentSlotsBinding ? "no_slots_agent" : "no_slots_global",
           {
             agentRunning: runningCount,
@@ -20404,7 +20428,13 @@ export function heartbeatService(
       }
 
       const queuedRuns = await db
-        .select()
+        .select({
+          ...getTableColumns(heartbeatRuns),
+          fairnessCreatedAt: sql<string>`${heartbeatRuns.createdAt}::text`,
+          // Database order preserves microseconds and UUID ties for the shortcut
+          // without changing the existing dependency/priority comparator.
+          fairnessOrder: sql<number>`row_number() over (order by ${heartbeatRuns.createdAt}, ${heartbeatRuns.id})`.mapWith(Number),
+        })
         .from(heartbeatRuns)
         .where(
           and(
@@ -20413,11 +20443,11 @@ export function heartbeatService(
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
           ),
         )
-        .orderBy(asc(heartbeatRuns.createdAt));
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
       if (queuedRuns.length === 0) {
         // With a cutoff armed this exit can mean queued runs exist but all sit
         // outside the worktree cutoff window; name that reason explicitly.
-        await logStartNoClaim(agentId, cutoff ? "cutoff" : "no_queued_runs", {
+        logNoClaim(cutoff ? "cutoff" : "no_queued_runs", {
           cutoffArmed: Boolean(cutoff),
         });
         return [];
@@ -20500,19 +20530,26 @@ export function heartbeatService(
         !parseGlobalClaimFairnessDisabled(
           runtimeEnv[HEARTBEAT_GLOBAL_CLAIM_FAIRNESS_ENV],
         );
-      let fairnessBlockedFromMs: number | null = null;
+      let fairnessBlockedFromOrder: number | null = null;
+      let claimAttempts = 0;
+      const maxClaimAttempts = Math.max(availableSlots * 2, 3);
+      const remainingHaveSameDeferral = (index: number, runId: string) => {
+        const marker = queuedClaimDeferral(runId);
+        return marker && prioritizedRuns.slice(index + 1).every(run =>
+          queuedClaimDeferral(run.id)?.reason === marker.reason);
+      };
       let fairnessBlocked = false;
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
+      for (const [index, queuedRun] of prioritizedRuns.entries()) {
+        if (claimedRuns.length >= availableSlots || claimAttempts >= maxClaimAttempts) break;
         if (claimFairnessActive) {
-          const candidateMs = queuedRun.createdAt.getTime();
+          const candidateOrder = queuedRun.fairnessOrder;
           // Monotone shortcut: the strictly-older competitor set only grows
-          // with createdAt and global room only shrinks as we claim, so once a
+          // with (createdAt, id) and global room only shrinks as we claim, so once a
           // candidate is reservation-blocked every later-created candidate is
           // too. Skip them without re-querying.
           if (
-            fairnessBlockedFromMs !== null &&
-            candidateMs >= fairnessBlockedFromMs
+            fairnessBlockedFromOrder !== null &&
+            candidateOrder >= fairnessBlockedFromOrder
           ) {
             fairnessBlocked = true;
             continue;
@@ -20524,17 +20561,18 @@ export function heartbeatService(
               claimedRuns.length,
           );
           const reservation =
-            await countOlderClaimableCrossAgentQueuedRuns(queuedRun, globalRoom);
-          if (reservation.count >= globalRoom) {
+            await countOlderClaimableCrossAgentQueuedRuns(queuedRun, globalRoom, cutoff);
+          if (reservation >= globalRoom) {
             // Every remaining global slot is reserved for strictly-older
             // claimable queued runs of other agents; hold this run back.
-            fairnessBlockedFromMs = candidateMs;
+            fairnessBlockedFromOrder = candidateOrder;
             fairnessBlocked = true;
             continue;
           }
         }
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
+          claimAttempts += 1;
           claimed = await claimQueuedRun(queuedRun, companyAgents);
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
@@ -20546,13 +20584,14 @@ export function heartbeatService(
             { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
             "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
           );
+          if (remainingHaveSameDeferral(index, queuedRun.id)) break;
           continue;
         }
         if (claimed) claimedRuns.push(claimed);
+        else if (remainingHaveSameDeferral(index, queuedRun.id)) break;
       }
       if (claimedRuns.length === 0) {
-        await logStartNoClaim(
-          agentId,
+        logNoClaim(
           fairnessBlocked ? "fairness_reserved_for_older" : "no_claim_succeeded",
           { fairnessBlocked },
         );

@@ -20,6 +20,8 @@ import {
   parseGlobalClaimFairnessDisabled,
   parseGlobalMaxConcurrentRuns,
 } from "../services/heartbeat.ts";
+import { logger } from "../middleware/logger.ts";
+import { explicitOperatorRunIdentity } from "../services/run-identity.ts";
 import { runningProcesses } from "../adapters/index.ts";
 
 // Optional gate so a test can hold a claimed run inside the adapter while it
@@ -53,6 +55,11 @@ vi.mock("../adapters/index.ts", async () => {
       execute: mockAdapterExecute,
     })),
   };
+});
+
+vi.mock("../services/run-identity.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/run-identity.ts")>("../services/run-identity.ts");
+  return { ...actual, explicitOperatorRunIdentity: vi.fn(actual.explicitOperatorRunIdentity) };
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -113,6 +120,8 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     releaseHeldRun = () => {};
     await heartbeat.drainActiveRunExecutions();
     mockAdapterExecute.mockClear();
+    vi.mocked(explicitOperatorRunIdentity).mockClear();
+    vi.restoreAllMocks();
     runningProcesses.clear();
     // Executed runs write to many company-scoped tables; clear them all.
     await db.execute(sql`truncate table ${companies} cascade`);
@@ -164,9 +173,9 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     status: "queued" | "running",
     ageMs = 60_000,
     issueId?: string,
+    runId = randomUUID(),
   ) {
     const wakeupRequestId = randomUUID();
-    const runId = randomUUID();
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
       companyId,
@@ -520,6 +529,213 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     releaseHeldRun();
     await heartbeat.drainActiveRunExecutions();
     expect(await runStatus(olderA)).toMatchObject({ status: "succeeded" });
+  });
+
+  it("bounds claim attempts for 40 unresolvable runs and admits another agent in one sweep", async () => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Unresolvable backlog");
+    const agentB = await insertAgent(companyId, "Healthy work");
+    for (let i = 0; i < 40; i++) {
+      const id = await insertRun(companyId, agentA, "queued", 3_600_000);
+      await db.update(agentWakeupRequests).set({
+        source: "automation", triggerDetail: "system", payload: {},
+        requestedByActorType: "system", requestedByActorId: null,
+      }).where(sql`${agentWakeupRequests.runId} = ${id}`);
+    }
+    const healthy = await insertRun(companyId, agentB, "queued");
+    const warn = vi.spyOn(logger, "warn");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(healthy)).toMatchObject({ status: "running" });
+    const attempts = warn.mock.calls.filter(([fields, message]) =>
+      message === "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass" &&
+      (fields as { agentId?: string }).agentId === agentA);
+    expect(attempts.length).toBeGreaterThan(0);
+    expect(attempts.length).toBeLessThan(10);
+    expect(attempts).toHaveLength(3);
+    // Each failed claim is resolved once; the mirror skips those markers.
+    for (const [fields] of attempts) {
+      const id = (fields as { runId: string }).runId;
+      expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.id === id)).toHaveLength(1);
+    }
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.agentId} = ${agentA} and ${heartbeatRuns.status} = 'queued'`)).toHaveLength(40);
+  });
+
+  it("reserves only one slot for an agent with headroom one and ten older runs at cap=6", async () => {
+    const capSix = heartbeatService(db, { runtimeEnv: { HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS: "6" } });
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Headroom one");
+    const agentB = await insertAgent(companyId, "Self refill");
+    const agentC = await insertAgent(companyId, "Four occupied slots");
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(sql`${agents.id} = ${agentA}`);
+    for (let i = 0; i < 4; i++) await insertRun(companyId, agentC, "running");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await capSix.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    for (let i = 0; i < 10; i++) await insertRun(companyId, agentA, "queued", 3_600_000);
+    const youngerB = await insertRun(companyId, agentB, "queued", 60_000);
+    const nextB = await insertRun(companyId, agentB, "queued", 30_000);
+    const releaseFirst = releaseHeldRun;
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    releaseFirst();
+    try {
+      await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(2), { timeout: 5000 });
+      expect(await runStatus(youngerB)).toMatchObject({ status: "running" });
+      expect(await runStatus(nextB)).toMatchObject({ status: "queued" });
+      await capSix.resumeQueuedRuns();
+      expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.agentId} = ${agentA} and ${heartbeatRuns.status} = 'running'`)).toHaveLength(1);
+      expect(await runStatus(nextB)).toMatchObject({ status: "queued" });
+    } finally {
+      adapterGate = null;
+      releaseHeldRun();
+      await capSix.drainActiveRunExecutions();
+    }
+  });
+
+  it("isolates an issue context lookup failure in both the sweep and reservation mirror", async () => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Broken context");
+    const agentB = await insertAgent(companyId, "Healthy context");
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Context failure", status: "todo", assigneeAgentId: agentA });
+    const older = await insertRun(companyId, agentA, "queued", 3_600_000, issueId);
+    const younger = await insertRun(companyId, agentB, "queued");
+    // Only the wide issue execution-context query selects this column. Reject
+    // its execution while letting dependency and ordering reads succeed.
+    const select = db.select.bind(db);
+    const spy = vi.spyOn(db, "select").mockImplementation(((fields: Record<string, unknown>) => {
+      if (fields && "chatCommunicationGuidance" in fields) throw new Error("issue context unavailable");
+      return select(fields as never);
+    }) as typeof db.select);
+    const warn = vi.spyOn(logger, "warn");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    try {
+      await heartbeat.resumeQueuedRuns();
+      expect(await runStatus(older)).toMatchObject({ status: "queued" });
+      expect(await runStatus(younger)).toMatchObject({ status: "running" });
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ agentId: agentA }),
+        "failed to resume agent's queued heartbeat runs");
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ runId: older, errorClass: "Error" }),
+        "queued heartbeat fairness eligibility failed; skipping reservation");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.each(["tied timestamp", "microseconds"])("uses database total order for %s reservations", async (kind) => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Older database order");
+    const agentB = await insertAgent(companyId, "Refill database order");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const older = await insertRun(companyId, agentA, "queued", 60_000, undefined,
+      kind === "tied timestamp" ? "00000000-0000-4000-8000-000000000001" : "00000000-0000-4000-8000-000000000003");
+    const younger = await insertRun(companyId, agentB, "queued", 60_000, undefined, "00000000-0000-4000-8000-000000000002");
+    await db.update(heartbeatRuns).set({ createdAt: sql`'2026-10-12 00:00:00.123456+00'::timestamptz` })
+      .where(sql`${heartbeatRuns.id} in (${older}, ${younger})`);
+    if (kind === "microseconds") await db.update(heartbeatRuns)
+      .set({ createdAt: sql`'2026-10-12 00:00:00.123455+00'::timestamptz` })
+      .where(sql`${heartbeatRuns.id} = ${older}`);
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(younger)).toMatchObject({ status: "queued" });
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(older)).toMatchObject({ status: "running" });
+    expect(await runStatus(younger)).toMatchObject({ status: "queued" });
+  });
+
+  it("stops reservation admission reads once one slot is reserved, including later same-agent candidates", async () => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Large old backlog");
+    const agentB = await insertAgent(companyId, "Several refill candidates");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    for (let i = 0; i < 25; i++) await insertRun(companyId, agentA, "queued", 3_600_000);
+    const younger = await insertRun(companyId, agentB, "queued", 60_000);
+    await insertRun(companyId, agentB, "queued", 30_000);
+    vi.mocked(explicitOperatorRunIdentity).mockClear();
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(younger)).toMatchObject({ status: "queued" });
+    expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.agentId === agentA)).toHaveLength(1);
+  });
+
+  it("does not skip an earlier UUID after a higher-priority tied candidate is reservation-blocked", async () => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Middle UUID");
+    const agentB = await insertAgent(companyId, "Priority order differs from UUID order");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Newer high priority", status: "todo",
+      priority: "critical", assigneeAgentId: agentB, responsibleUserId: "board-user",
+    });
+    const oldestB = await insertRun(companyId, agentB, "queued", 60_000, undefined, "00000000-0000-4000-8000-000000000001");
+    const middleA = await insertRun(companyId, agentA, "queued", 60_000, undefined, "00000000-0000-4000-8000-000000000002");
+    const newestB = await insertRun(companyId, agentB, "queued", 60_000, issueId, "00000000-0000-4000-8000-000000000003");
+    await db.update(heartbeatRuns).set({ createdAt: sql`'2026-10-12 00:00:00.123456+00'::timestamptz` })
+      .where(sql`${heartbeatRuns.id} in (${oldestB}, ${middleA}, ${newestB})`);
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(oldestB)).toMatchObject({ status: "succeeded" });
+    expect(await runStatus(middleA)).toMatchObject({ status: "queued" });
+    expect(await runStatus(newestB)).toMatchObject({ status: "queued" });
+  });
+
+  it("retries a marked admission after its responsible user becomes resolvable", async () => {
+    const companyId = await insertCompany();
+    const agent = await insertAgent(companyId, "Repairable identity");
+    const runId = await insertRun(companyId, agent, "queued");
+    await db.update(agentWakeupRequests).set({
+      source: "automation", triggerDetail: "system", payload: {},
+      requestedByActorType: "system", requestedByActorId: null,
+    }).where(sql`${agentWakeupRequests.runId} = ${runId}`);
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(runId)).toMatchObject({ status: "queued" });
+    await db.update(agentWakeupRequests).set({
+      source: "on_demand", triggerDetail: "manual", payload: { manualUserWake: true },
+      requestedByActorType: "user", requestedByActorId: "board-user",
+    }).where(sql`${agentWakeupRequests.runId} = ${runId}`);
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(runId)).toMatchObject({ status: "running" });
+  });
+
+  it("rate limits aged no-claim info logs to once per agent per five minutes", async () => {
+    const companyId = await insertCompany();
+    const agent = await insertAgent(companyId, "Aged backlog");
+    await insertRun(companyId, agent, "running");
+    await insertRun(companyId, agent, "queued", 3_600_000);
+    const info = vi.spyOn(logger, "info");
+    const debug = vi.spyOn(logger, "debug");
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const noClaim = ([fields, message]: unknown[]) =>
+      message === "startNextQueuedRunForAgent: queued run not claimed" &&
+      (fields as { agentId?: string }).agentId === agent;
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.resumeQueuedRuns();
+    expect(info.mock.calls.filter(noClaim)).toHaveLength(1);
+    expect(debug.mock.calls.filter(noClaim)).toHaveLength(1);
+    clock.mockReturnValue(now + 5 * 60_000);
+    await heartbeat.resumeQueuedRuns();
+    expect(info.mock.calls.filter(noClaim)).toHaveLength(2);
+    clock.mockRestore();
   });
 
   it("keeps first-come-first-served self-refill when HEARTBEAT_GLOBAL_CLAIM_FAIRNESS=off", async () => {
