@@ -2181,6 +2181,44 @@ function applyActorMonitorScheduledBy(
   );
 }
 
+function stageSignature(stages: NonNullable<NormalizedExecutionPolicy>["stages"]) {
+  return JSON.stringify(
+    stages.map((stage) => [
+      stage.type,
+      stage.participants.map((participant) =>
+        participant.type === "agent"
+          ? `agent:${participant.agentId}`
+          : `user:${participant.userId}`,
+      ),
+    ]),
+  );
+}
+
+/**
+ * Review/approval stages are a gate on the worker, so the worker must not be able to edit them.
+ * For agent actors the stored stages always win: a body that omits `stages` (for example a
+ * monitor-only policy) or is null keeps them, and a body that sends different `stages` is rejected.
+ */
+function protectStagesFromAgentEdit(
+  stored: NormalizedExecutionPolicy,
+  requested: NormalizedExecutionPolicy,
+  rawPolicy: unknown,
+): NormalizedExecutionPolicy {
+  if (!stored || stored.stages.length === 0) return requested;
+  const bodyHasStages =
+    typeof rawPolicy === "object" && rawPolicy !== null && "stages" in rawPolicy;
+  if (
+    bodyHasStages &&
+    stageSignature(requested?.stages ?? []) !== stageSignature(stored.stages)
+  ) {
+    throw forbidden("Agents cannot change or remove review or approval stages");
+  }
+  return {
+    ...(requested ?? { mode: stored.mode, commentRequired: true }),
+    stages: stored.stages,
+  };
+}
+
 async function assertCanManageIssueMonitor(
   accessSvc: ReturnType<typeof accessService>,
   req: Request,
@@ -13101,8 +13139,17 @@ export function issueRoutes(
           });
       }
       if (req.body.executionPolicy !== undefined) {
+        const requestedExecutionPolicy = normalizeIssueExecutionPolicy(
+          req.body.executionPolicy,
+        );
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
-          normalizeIssueExecutionPolicy(req.body.executionPolicy),
+          req.actor.type === "agent"
+            ? protectStagesFromAgentEdit(
+                normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
+                requestedExecutionPolicy,
+                req.body.executionPolicy,
+              )
+            : requestedExecutionPolicy,
           actor.actorType,
         );
       }
