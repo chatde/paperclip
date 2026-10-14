@@ -2220,22 +2220,36 @@ function protectStagesFromAgentEdit(
   };
 }
 
-// Mirrors Hermes MODEL_PREFIX_PROVIDER_HINTS, with Gemini resolved to its
-// provider identity rather than the adapter's automatic routing hint.
+// Provider identity for the review-gate diversity check. Non-Hermes adapters are bound
+// to one vendor regardless of the model string (a Codex seat is OpenAI whatever model it
+// names; a Claude seat is Anthropic). Hermes agents resolve like the Hermes adapter does:
+// explicit provider (ignoring "auto"), else the vendor in a "vendor/model" id, else a
+// model-prefix hint, else the adapter type. Hint values name the underlying vendor so a
+// Hermes agent on an OpenAI model and a Codex seat count as the same provider.
+const adapterProviderFamily: Record<string, string> = {
+  claude_local: "anthropic",
+  codex_local: "openai",
+  grok_local: "xai",
+  gemini_local: "gemini",
+  kimi_local: "kimi",
+  cursor_local: "cursor",
+  cursor_cloud: "cursor",
+  opencode_local: "opencode",
+  pi_local: "pi",
+};
 const reviewModelProviderHints: [string, string][] = [
   ["mimo", "xiaomi"],
   ["nvidia/", "nvidia"],
-  ["gpt-4", "openai-codex"],
-  ["gpt-5", "copilot"],
-  ["o1-", "openai-codex"],
-  ["o3-", "openai-codex"],
-  ["o4-", "openai-codex"],
+  ["gpt-", "openai"],
+  ["o1-", "openai"],
+  ["o3-", "openai"],
+  ["o4-", "openai"],
   ["claude", "anthropic"],
   ["gemini", "gemini"],
   ["hermes-", "nous"],
   ["glm-", "zai"],
-  ["moonshot", "kimi-coding"],
-  ["kimi", "kimi-coding"],
+  ["moonshot", "kimi"],
+  ["kimi", "kimi"],
   ["minimax", "minimax"],
   ["huggingface/", "huggingface"],
 ];
@@ -2244,13 +2258,25 @@ function reviewProviderForAgent(agent: {
   adapterConfig: Record<string, unknown>;
   adapterType: string;
 }): string | null {
+  const adapterType = readNonEmptyString(agent.adapterType)?.toLowerCase() ?? null;
+  // Single-vendor adapters are bound to that vendor whatever model they name. Runner-style
+  // adapters (hermes_local, hermes_gateway, paperclip_runner, acpx) choose a provider per
+  // agent, so they resolve from provider/model below.
+  if (adapterType && adapterType in adapterProviderFamily) {
+    return adapterProviderFamily[adapterType];
+  }
   const provider = readNonEmptyString(agent.adapterConfig?.provider)?.toLowerCase();
   if (provider && provider !== "auto") return provider;
   const model = readNonEmptyString(agent.adapterConfig?.model)?.toLowerCase();
-  const inferred = model
-    ? reviewModelProviderHints.find(([prefix]) => model.startsWith(prefix))?.[1]
-    : undefined;
-  return inferred ?? readNonEmptyString(agent.adapterType)?.toLowerCase() ?? null;
+  if (model) {
+    if (model.includes("/")) {
+      const vendor = model.split("/")[0];
+      if (vendor) return vendor;
+    }
+    const hit = reviewModelProviderHints.find(([prefix]) => model.startsWith(prefix))?.[1];
+    if (hit) return hit;
+  }
+  return adapterType;
 }
 
 async function assertReviewProviderDiversity(

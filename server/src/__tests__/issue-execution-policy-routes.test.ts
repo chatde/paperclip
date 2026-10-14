@@ -499,6 +499,10 @@ describe("issue execution policy routes", () => {
       [{ model: "MiniMax-M2.7" }, { provider: "minimax" }, "hermes_local", 403],
       [{ model: "gemini-3-flash" }, { provider: "gemini" }, "hermes_local", 403],
       [{ provider: "xiaomi", model: "claude-sonnet" }, { provider: "xiaomi" }, "hermes_local", 403],
+      [{ model: "anthropic/claude-sonnet" }, {}, "claude_local", 403],
+      [{ model: "anthropic/claude-sonnet" }, { provider: "xiaomi" }, "hermes_local", 200],
+      [{ model: "gpt-5.4" }, { model: "gpt-6-sol" }, "codex_local", 403],
+      [{ model: "gpt-5.4" }, {}, "claude_local", 200],
       [{ provider: "xiaomi" }, {}, "claude_local", 200],
       [{ model: "mimo-v2.6-pro" }, {}, "claude_local", 200],
     ])("resolves provider identity for %j and %j (%s)", async (workerConfig, reviewerConfig, reviewerAdapter, status) => {
