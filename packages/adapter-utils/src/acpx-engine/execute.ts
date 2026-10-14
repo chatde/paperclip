@@ -40,6 +40,7 @@ import { captureLocalProcess, capturedProcessExited, killCapturedLocalProcess } 
 import type { DuplexLossReason } from "../duplex-observability.js";
 import { DUPLEX_CHANNEL_LOST_ERROR_CODE } from "../bridge-transport-contract.js";
 import {
+  classifyProviderAuthTerminalSessionFailure,
   formatTerminalSessionFailure,
   sanitizeTerminalSessionFailure,
   type AcpxTerminalSessionFailure,
@@ -4789,7 +4790,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             terminalSessionFailure = sanitizeTerminalSessionFailure(
               failure, prepared.env, ctx.authToken, parseObject(ctx.config.env),
             );
-            terminalFailureClassification = deps.classifyTerminalSessionFailure?.(failure, new Date(now())) ?? null;
+            // The adapter's own classifier (for example the quota
+            // classifiers) claims the failure first; a definite provider auth
+            // rejection (401 / invalid_grant class) then falls to the shared
+            // terminal classification so the run reaches the re-auth repair
+            // path instead of any retry lane.
+            terminalFailureClassification =
+              deps.classifyTerminalSessionFailure?.(failure, new Date(now())) ??
+              classifyProviderAuthTerminalSessionFailure(failure);
           },
         });
         activeTurn = turn;

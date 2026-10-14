@@ -187,6 +187,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     agentId: string;
     now: Date;
     errorCode: string;
+    error?: string;
     errorFamily?: "transient_upstream" | "provider_quota" | null;
     retryNotBefore?: string | null;
     scheduledRetryAttempt?: number;
@@ -227,7 +228,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       agentId: input.agentId,
       invocationSource: "assignment",
       status: "failed",
-      error: "upstream overload",
+      error: input.error ?? "upstream overload",
       errorCode: input.errorCode,
       finishedAt: input.now,
       scheduledRetryAttempt: input.scheduledRetryAttempt ?? 0,
@@ -288,6 +289,163 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, children[0]!.id));
     await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0, retryReason: "execution_review_participant_recovery" });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(1);
+  });
+
+  it.each([
+    [
+      "acpx_auth_required",
+      "ACP agent reported a terminal access failure.\nFailed to authenticate. API Error: 401 OAuth access token has expired",
+    ],
+    [
+      "claude_auth_required",
+      "ACP agent reported a terminal access failure.\nFailed to authenticate. API Error: 401 Invalid bearer token",
+    ],
+    [
+      "acpx_auth_required",
+      'oauth2: "invalid_grant" - the configured refresh token is no longer valid',
+    ],
+  ])(
+    "treats the provider auth rejection %s as terminal: zero successor retry runs and no retry budget consumed",
+    async (errorCode, error) => {
+      const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+      const now = new Date("2026-04-20T12:00:00.000Z");
+      await seedRetryFixture({
+        runId,
+        companyId,
+        agentId,
+        now,
+        errorCode,
+        error,
+        resultJson: {
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+          terminalSessionFailure: { category: "access", title: error },
+        },
+      });
+      // The transient lane refuses the retry (TOP-595) ...
+      expect(
+        await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 }),
+      ).toMatchObject({ outcome: "not_scheduled", errorCode: "provider_auth_rejected" });
+      // ... and so does the process-loss lane.
+      expect(
+        await heartbeat.scheduleBoundedRetry(runId, {
+          now,
+          random: () => 0,
+          retryReason: "process_lost",
+          maxAttempts: 3,
+        }),
+      ).toMatchObject({ outcome: "not_scheduled", errorCode: "provider_auth_rejected" });
+      // Zero successor retry runs exist for this failure.
+      expect(
+        await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
+      ).toHaveLength(0);
+      // The retry budget was not consumed.
+      const [source] = await db
+        .select({
+          attempt: heartbeatRuns.scheduledRetryAttempt,
+          reason: heartbeatRuns.scheduledRetryReason,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId));
+      expect(source).toEqual({ attempt: 0, reason: null });
+      // No retry wakeups were queued for the seat.
+      expect(
+        await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)),
+      ).toHaveLength(0);
+      // The durable run event records the terminal decision for the owner.
+      const events = await db
+        .select({ message: heartbeatRunEvents.message })
+        .from(heartbeatRunEvents)
+        .where(eq(heartbeatRunEvents.runId, runId));
+      expect(
+        events.some((event) => event.message.includes("no retry will be scheduled")),
+      ).toBe(true);
+    },
+  );
+
+  it("treats the pre-classification ACP terminal access failure shape as terminal", async () => {
+    // The live evidence shape (TOP-595): the run carries the engine's terminal
+    // access failure with the provider 401 text before any auth classification
+    // lands on the error code.
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    const error =
+      "ACP agent reported a terminal access failure.\nFailed to authenticate. API Error: 401 OAuth access token has expired";
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "acpx_turn_failed",
+      error,
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        terminalSessionFailure: {
+          category: "access",
+          title: "Failed to authenticate. API Error: 401 OAuth access token has expired",
+        },
+      },
+    });
+    expect(
+      await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 }),
+    ).toMatchObject({ outcome: "not_scheduled", errorCode: "provider_auth_rejected" });
+    expect(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
+    ).toHaveLength(0);
+  });
+
+  it("does not consume a mid-chain retry budget when a rejection arrives late", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "acpx_auth_required",
+      error: "Failed to authenticate. API Error: 401 Invalid bearer token",
+      scheduledRetryAttempt: 1,
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        terminalSessionFailure: {
+          category: "access",
+          title: "Failed to authenticate. API Error: 401 Invalid bearer token",
+        },
+      },
+    });
+    expect(
+      await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 }),
+    ).toMatchObject({ outcome: "not_scheduled", errorCode: "provider_auth_rejected" });
+    const [source] = await db
+      .select({
+        attempt: heartbeatRuns.scheduledRetryAttempt,
+        reason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(source).toEqual({ attempt: 1, reason: "transient_failure" });
+    expect(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
+    ).toHaveLength(0);
+  });
+
+  it("keeps bounded recovery for a login-required auth failure without a provider rejection", async () => {
+    // A missing-credential setup state is not a rejected credential: it keeps
+    // the existing bounded-recovery behavior instead of failing terminal.
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "claude_auth_required",
+      error: "Please run the provider login command to authenticate.",
+    });
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 });
+    expect(scheduled.outcome).toBe("scheduled");
+    expect(
+      await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)),
+    ).toHaveLength(1);
   });
 
   it.each([

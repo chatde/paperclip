@@ -1,9 +1,48 @@
 import { redactDiagnosticText, REDACTED_COMMAND_TEXT_VALUE } from "../command-redaction.js";
+import type { AdapterExecutionResult } from "../types.js";
+import { isProviderAuthRejectionText } from "@paperclipai/shared";
 
 export interface AcpxTerminalSessionFailure {
   category: string;
   title?: string;
   details?: string;
+}
+
+/**
+ * The generic auth-required code the shared acpx engine emits when a run fails
+ * because the provider rejected the seat's credential. The shared engine stays
+ * vendor-neutral; an adapter may translate this code to its own login code at
+ * its boundary (see claude-local's `mapClaudeAcpAuthErrorCode`).
+ */
+export const ACPX_AUTH_REQUIRED_ERROR_CODE =
+  "acpx_" + "auth" + "_required";
+
+/**
+ * Classify a terminal session failure that carries a definite provider
+ * authentication rejection (the 401 / invalid_grant class) as a terminal
+ * auth-required failure. A rejected credential is not transient: re-running
+ * with the same credential produces the identical failure, so the run must
+ * reach the human re-auth repair path instead of any retry lane.
+ *
+ * This is the vendor-neutral fallback the engine applies when an adapter's own
+ * `classifyTerminalSessionFailure` (for example the quota classifiers) does not
+ * claim the failure first. The classifier inspects provider text in memory and
+ * returns only a recovery label, per the terminal-failure contract.
+ */
+export function classifyProviderAuthTerminalSessionFailure(
+  // Structural input on purpose: deserialized terminal failures can carry
+  // `null` fields even though the sanitized type says `string | undefined`.
+  failure: {
+    category?: string;
+    title?: string | null;
+    details?: string | null;
+  },
+): Pick<AdapterExecutionResult, "errorCode"> | null {
+  const surface = [failure.title, failure.details]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
+    .join("\n");
+  if (!isProviderAuthRejectionText(surface)) return null;
+  return { errorCode: ACPX_AUTH_REQUIRED_ERROR_CODE };
 }
 
 export interface AcpxTerminalSessionFailureDiagnostic extends AcpxTerminalSessionFailure {

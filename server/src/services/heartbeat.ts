@@ -1,5 +1,5 @@
 import { externalObjectService } from "./external-objects.js";
-import { isAiAuthenticationBlocked } from "./ai-auth-failure.js";
+import { isAiAuthenticationBlocked, isTerminalProviderAuthRejection } from "./ai-auth-failure.js";
 import { CHAT_COMPLETION_WAKE_REASON, prepareChatCompletionTurn, chatCompletionInstruction, isCompletedOnboardingHandoffWake } from "./chat-completion-delivery.js";
 import { AgentDirectoryReuseInvalidatedError, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 
@@ -15361,6 +15361,31 @@ export function heartbeatService(
       retryDelaysMs?: readonly number[];
     },
   ) {
+    // A provider auth rejection (the 401 / invalid_grant class) is terminal for
+    // every retry lane: transient, process-loss and continuation retries all
+    // funnel through this scheduler. Re-running with the same rejected
+    // credential reproduces the identical failure and burns the retry budget in
+    // bursts, so no successor run is scheduled and no retry budget is consumed.
+    // Recovery owns to the human re-auth repair card (see
+    // connectionIntentService.requestForRunAuthFailure), which activates as
+    // soon as the run carries an auth error code (TOP-595).
+    if (isTerminalProviderAuthRejection(run)) {
+      const reason =
+        "The provider rejected this seat's credential (401/invalid_grant class); an automatic retry cannot succeed until the seat re-authenticates";
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `${reason}; no retry will be scheduled`,
+        payload: { terminalProviderAuthRejection: true },
+      });
+      return {
+        outcome: "not_scheduled" as const,
+        reason,
+        errorCode: "provider_auth_rejected" as const,
+        issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
+      };
+    }
     if (Array.isArray(run.contextSnapshot?.chatCompletionDeliveryIds) &&
         run.contextSnapshot.chatCompletionDeliveryIds.some(id => typeof id === "string")) {
       return { outcome: "not_scheduled" as const, reason: "The completion outbox owns this reply's retry budget and publication identity.",
