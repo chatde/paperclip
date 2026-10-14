@@ -649,6 +649,34 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     }
   });
 
+  it("claims healthy same-agent work behind three transient issue-lock nulls in the same sweep", async () => {
+    // Grok review 3: a null claim (issue executing under another run) leaves the row queued
+    // with no marker, so it must not spend the three-failure budget, or three locked wakes at
+    // the head would hold back every later runnable row of the same agent on every sweep.
+    const capTwo = heartbeatService(db, { runtimeEnv: { HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS: "2" } });
+    const companyId = await insertCompany();
+    const agent = await insertAgent(companyId, "Locked heads then healthy");
+    const owner = await insertRun(companyId, agent, "running");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Locked issue", status: "in_progress",
+      assigneeAgentId: agent, responsibleUserId: "board-user", executionRunId: owner,
+    });
+    const locked: string[] = [];
+    for (const age of [300_000, 240_000, 180_000]) locked.push(await insertRun(companyId, agent, "queued", age, issueId));
+    const healthy = await insertRun(companyId, agent, "queued", 60_000);
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    try {
+      await capTwo.resumeQueuedRuns();
+      await vi.waitFor(async () => expect(await runStatus(healthy)).toMatchObject({ status: "running" }), { timeout: 5000 });
+      for (const id of locked) expect(await runStatus(id)).toMatchObject({ status: "queued" });
+    } finally {
+      adapterGate = null;
+      releaseHeldRun();
+      await capTwo.drainActiveRunExecutions();
+    }
+  });
+
   it("reserves only one slot for an agent with headroom one and ten older runs at cap=6", async () => {
     const capSix = heartbeatService(db, { runtimeEnv: { HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS: "6" } });
     const companyId = await insertCompany();

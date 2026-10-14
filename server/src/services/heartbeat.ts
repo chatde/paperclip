@@ -20539,9 +20539,17 @@ export function heartbeatService(
         );
       let fairnessBlockedFromOrder: number | null = null;
       let failedAttempts = 0;
+      // Transient null claims (issue lock held by another run, settling owner, stale
+      // admission) leave the row queued with no marker, so they must not spend the
+      // failure budget: three locked wakes at the head would otherwise hold back every
+      // later runnable row of the same agent on every sweep. They get their own, larger
+      // bound so a long locked backlog still costs a bounded number of attempts.
+      let nullAttempts = 0;
+      const maxNullAttempts = Math.max(availableSlots * 2, 6);
       let fairnessBlocked = false;
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots || failedAttempts >= 3) break;
+        if (nullAttempts >= maxNullAttempts) break;
         // Marked heads consume no attempt budget; successive sweeps progress
         // toward healthy work farther down the same agent's queue.
         if (queuedClaimDeferral(queuedRun.id)) continue;
@@ -20591,7 +20599,7 @@ export function heartbeatService(
           continue;
         }
         if (claimed) claimedRuns.push(claimed);
-        else failedAttempts += 1;
+        else nullAttempts += 1;
       }
       if (claimedRuns.length === 0) {
         logNoClaim(
