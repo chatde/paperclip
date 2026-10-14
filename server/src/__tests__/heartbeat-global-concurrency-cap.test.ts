@@ -203,6 +203,20 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     return runId;
   }
 
+  async function makeUserUnresolvable(runId: string) {
+    await db.update(agentWakeupRequests).set({
+      source: "automation", triggerDetail: "system", payload: {},
+      requestedByActorType: "system", requestedByActorId: null,
+    }).where(sql`${agentWakeupRequests.runId} = ${runId}`);
+  }
+
+  async function repairUser(runId: string) {
+    await db.update(agentWakeupRequests).set({
+      source: "on_demand", triggerDetail: "manual", payload: { manualUserWake: true },
+      requestedByActorType: "user", requestedByActorId: "board-user",
+    }).where(sql`${agentWakeupRequests.runId} = ${runId}`);
+  }
+
   async function runStatus(runId: string) {
     return db
       .select({ status: heartbeatRuns.status })
@@ -531,35 +545,108 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     expect(await runStatus(olderA)).toMatchObject({ status: "succeeded" });
   });
 
-  it("bounds claim attempts for 40 unresolvable runs and admits another agent in one sweep", async () => {
+  it("bounds attempts across three sweeps of 40 unresolvable runs and admits another agent each sweep", async () => {
     const companyId = await insertCompany();
     const agentA = await insertAgent(companyId, "Unresolvable backlog");
     const agentB = await insertAgent(companyId, "Healthy work");
     for (let i = 0; i < 40; i++) {
-      const id = await insertRun(companyId, agentA, "queued", 3_600_000);
-      await db.update(agentWakeupRequests).set({
-        source: "automation", triggerDetail: "system", payload: {},
-        requestedByActorType: "system", requestedByActorId: null,
-      }).where(sql`${agentWakeupRequests.runId} = ${id}`);
+      await makeUserUnresolvable(await insertRun(companyId, agentA, "queued", 3_600_000));
     }
-    const healthy = await insertRun(companyId, agentB, "queued");
     const warn = vi.spyOn(logger, "warn");
-    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
-    await heartbeat.resumeQueuedRuns();
-    expect(await runStatus(healthy)).toMatchObject({ status: "running" });
+    for (let sweep = 0; sweep < 3; sweep++) {
+      const healthy = await insertRun(companyId, agentB, "queued");
+      adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+      await heartbeat.resumeQueuedRuns();
+      expect(await runStatus(healthy)).toMatchObject({ status: "running" });
+      adapterGate = null;
+      releaseHeldRun();
+      await heartbeat.drainActiveRunExecutions();
+    }
     const attempts = warn.mock.calls.filter(([fields, message]) =>
       message === "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass" &&
       (fields as { agentId?: string }).agentId === agentA);
     expect(attempts.length).toBeGreaterThan(0);
-    expect(attempts.length).toBeLessThan(10);
-    expect(attempts).toHaveLength(3);
-    // Each failed claim is resolved once; the mirror skips those markers.
-    for (const [fields] of attempts) {
-      const id = (fields as { runId: string }).runId;
-      expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.id === id)).toHaveLength(1);
-    }
+    expect(attempts.length).toBeLessThanOrEqual(9);
+    const identityCalls = vi.mocked(explicitOperatorRunIdentity).mock.calls
+      .filter(([, run]) => run.agentId === agentA);
+    expect(identityCalls).toHaveLength(40);
+    expect(new Set(identityCalls.map(([, run]) => run.id)).size).toBe(40);
     expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(sql`${heartbeatRuns.agentId} = ${agentA} and ${heartbeatRuns.status} = 'queued'`)).toHaveLength(40);
+  });
+
+  it("skips three marked heads and claims healthy same-agent work on the next sweep", async () => {
+    const companyId = await insertCompany();
+    const agent = await insertAgent(companyId, "Same-agent progress");
+    const heads: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const id = await insertRun(companyId, agent, "queued", 3_600_000);
+      await makeUserUnresolvable(id);
+      heads.push(id);
+    }
+    const healthy = await insertRun(companyId, agent, "queued");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(healthy)).toMatchObject({ status: "queued" });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    await heartbeat.resumeQueuedRuns();
+    expect(await runStatus(healthy)).toMatchObject({ status: "running" });
+    for (const id of heads) {
+      expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.id === id)).toHaveLength(1);
+    }
+  });
+
+  it("bounds identity checks to 16 per mirror call and skips marked tails on the next call", async () => {
+    const companyId = await insertCompany();
+    const agentA = await insertAgent(companyId, "Unresolvable mirror tail");
+    const agentB = await insertAgent(companyId, "Repeated self-refill");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    for (let i = 0; i < 40; i++) {
+      await makeUserUnresolvable(await insertRun(companyId, agentA, "queued", 3_600_000));
+    }
+    await insertRun(companyId, agentB, "queued", 60_000);
+    await insertRun(companyId, agentB, "queued", 30_000);
+    for (let call = 1; call <= 2; call++) {
+      const releasePrevious = releaseHeldRun;
+      adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+      releasePrevious();
+      await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(call + 1), { timeout: 5000 });
+      const identityCalls = vi.mocked(explicitOperatorRunIdentity).mock.calls
+        .filter(([, run]) => run.agentId === agentA);
+      expect(identityCalls).toHaveLength(call * 16);
+      expect(new Set(identityCalls.map(([, run]) => run.id)).size).toBe(call * 16);
+    }
+  });
+
+  it("retries a transient null issue-lock claim on the next sweep without a marker", async () => {
+    const capTwo = heartbeatService(db, { runtimeEnv: { HEARTBEAT_GLOBAL_MAX_CONCURRENT_RUNS: "2" } });
+    const companyId = await insertCompany();
+    const agent = await insertAgent(companyId, "Issue-lock retry");
+    const owner = await insertRun(companyId, agent, "running");
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Locked issue", status: "in_progress",
+      assigneeAgentId: agent, responsibleUserId: "board-user", executionRunId: owner,
+    });
+    const queued = await insertRun(companyId, agent, "queued", 60_000, issueId);
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    try {
+      await capTwo.resumeQueuedRuns();
+      expect(await runStatus(queued)).toMatchObject({ status: "queued" });
+      expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.id === queued)).toHaveLength(1);
+      await db.update(issues).set({ executionRunId: null }).where(sql`${issues.id} = ${issueId}`);
+      await capTwo.resumeQueuedRuns();
+      expect(await runStatus(queued)).toMatchObject({ status: "running" });
+      // Execution may resolve identity again after the successful claim.
+      expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.id === queued).length).toBeGreaterThanOrEqual(2);
+    } finally {
+      adapterGate = null;
+      releaseHeldRun();
+      await capTwo.drainActiveRunExecutions();
+    }
   });
 
   it("reserves only one slot for an agent with headroom one and ten older runs at cap=6", async () => {
@@ -697,23 +784,61 @@ describeEmbeddedPostgres("heartbeat global concurrency cap", () => {
     expect(await runStatus(newestB)).toMatchObject({ status: "queued" });
   });
 
-  it("retries a marked admission after its responsible user becomes resolvable", async () => {
+  it("reserves a repaired run after its 90-second marker expires before a younger self-refill", async () => {
     const companyId = await insertCompany();
-    const agent = await insertAgent(companyId, "Repairable identity");
-    const runId = await insertRun(companyId, agent, "queued");
-    await db.update(agentWakeupRequests).set({
-      source: "automation", triggerDetail: "system", payload: {},
-      requestedByActorType: "system", requestedByActorId: null,
-    }).where(sql`${agentWakeupRequests.runId} = ${runId}`);
+    const agentA = await insertAgent(companyId, "Repairable identity");
+    const agentB = await insertAgent(companyId, "Younger self-refill");
+    const older = await insertRun(companyId, agentA, "queued", 3_600_000);
+    await makeUserUnresolvable(older);
+    // The fake clock starts 90 s in the past and catches up to the real clock;
+    // it must never run ahead of the database clock. A claimed run's legacy
+    // controller lease expires at clock_timestamp() + 60 s and its watcher
+    // compares that to Date.now(), so a clock 60 s or more ahead aborts every
+    // claim at setup ("Legacy controller lease lost") before the adapter runs.
+    const now = Date.now() - 90_000;
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     await heartbeat.resumeQueuedRuns();
-    expect(await runStatus(runId)).toMatchObject({ status: "queued" });
-    await db.update(agentWakeupRequests).set({
-      source: "on_demand", triggerDetail: "manual", payload: { manualUserWake: true },
-      requestedByActorType: "user", requestedByActorId: "board-user",
-    }).where(sql`${agentWakeupRequests.runId} = ${runId}`);
+    expect(await runStatus(older)).toMatchObject({ status: "queued" });
+    await repairUser(older);
+    clock.mockReturnValue(now + 89_999);
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await insertRun(companyId, agentB, "queued");
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(await runStatus(older)).toMatchObject({ status: "queued" });
+    expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.id === older)).toHaveLength(1);
+    const younger = await insertRun(companyId, agentB, "queued", 30_000);
+    clock.mockReturnValue(now + 90_000);
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(younger)).toMatchObject({ status: "queued" });
+    // Expiry restored the reservation, with no admission attempt by A yet.
+    expect(vi.mocked(explicitOperatorRunIdentity).mock.calls.filter(([, run]) => run.id === older)).toHaveLength(2);
     adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
     await heartbeat.resumeQueuedRuns();
-    expect(await runStatus(runId)).toMatchObject({ status: "running" });
+    expect(await runStatus(older)).toMatchObject({ status: "running" });
+    expect(await runStatus(younger)).toMatchObject({ status: "queued" });
+    clock.mockRestore();
+  });
+
+  it("clears a queued run's marker when another run of its agent completes", async () => {
+    const companyId = await insertCompany();
+    const agent = await insertAgent(companyId, "Completion invalidates deferral");
+    const older = await insertRun(companyId, agent, "queued", 3_600_000);
+    await makeUserUnresolvable(older);
+    const healthy = await insertRun(companyId, agent, "queued");
+    adapterGate = new Promise<void>(resolve => { releaseHeldRun = resolve; });
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(await runStatus(older)).toMatchObject({ status: "queued" });
+    expect(await runStatus(healthy)).toMatchObject({ status: "running" });
+    await repairUser(older);
+    adapterGate = null;
+    releaseHeldRun();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await runStatus(older)).toMatchObject({ status: "succeeded" });
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(2);
   });
 
   it("rate limits aged no-claim info logs to once per agent per five minutes", async () => {

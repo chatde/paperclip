@@ -720,7 +720,7 @@ const CROSS_AGENT_FAIRNESS_LOOKBACK = 25;
 // and deserves info-level visibility; younger backlogs log at debug.
 const STARVING_NO_CLAIM_LOG_AGE_MS = 10 * 60_000;
 const NO_CLAIM_INFO_INTERVAL_MS = 5 * 60_000;
-const CLAIM_DEFERRAL_RETENTION_MS = 5 * 60_000;
+const CLAIM_DEFERRAL_RETENTION_MS = 90_000;
 type QueuedRunIdentity = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "contextSnapshot" | "wakeupRequestId" |
   "responsibleUserId" | "invocationSource" | "triggerDetail">;
@@ -17373,14 +17373,14 @@ export function heartbeatService(
     });
   }
 
-  // Advisory cache only: actual admission always retries, even while a marker
-  // suppresses reservations. Bound memory and expire markers for deleted runs.
-  const queuedClaimDeferrals = new Map<string, { reason: string; at: number }>();
+  // Short-lived advisory cache shared by admission and reservation reads.
+  // Skipping known deferrals lets each sweep advance through an unhealthy queue.
+  const queuedClaimDeferrals = new Map<string, { agentId: string; reason: string; at: number }>();
   const noClaimInfoAt = new Map<string, number>();
 
-  function rememberQueuedClaimDeferral(runId: string, reason: string) {
-    queuedClaimDeferrals.delete(runId);
-    queuedClaimDeferrals.set(runId, { reason, at: Date.now() });
+  function rememberQueuedClaimDeferral(run: { id: string; agentId: string }, reason: string) {
+    queuedClaimDeferrals.delete(run.id);
+    queuedClaimDeferrals.set(run.id, { agentId: run.agentId, reason, at: Date.now() });
     if (queuedClaimDeferrals.size > 10_000) {
       queuedClaimDeferrals.delete(queuedClaimDeferrals.keys().next().value!);
     }
@@ -17401,21 +17401,13 @@ export function heartbeatService(
   ) {
     try {
       const claimed = await attemptQueuedRunClaim(run, companyAgents);
-      if (claimed) {
-        queuedClaimDeferrals.delete(run.id);
-      } else {
-        const [current] = await db.select({ status: heartbeatRuns.status })
-          .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
-        if (current?.status === "queued") {
-          rememberQueuedClaimDeferral(run.id, "admission_deferred");
-        } else {
-          queuedClaimDeferrals.delete(run.id);
-        }
-      }
+      // A null claim is transient (for example an issue lock), not evidence
+      // for a deferral marker. Claimed/cancelled rows also discard old markers.
+      queuedClaimDeferrals.delete(run.id);
       return claimed;
     } catch (err) {
       if (isDeferrableClaimRejection(err) && err.status !== 403) {
-        rememberQueuedClaimDeferral(run.id, `http_${err.status}:${err.message}`);
+        rememberQueuedClaimDeferral(run, `http_${err.status}:${err.message}`);
       }
       throw err;
     }
@@ -18195,6 +18187,11 @@ export function heartbeatService(
     failureReason?: string | null,
     options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean },
   ) {
+    // Completion may resolve the condition that deferred another run of this
+    // agent. Let the next claim/reservation attempt recheck it immediately.
+    for (const [runId, marker] of queuedClaimDeferrals) {
+      if (marker.agentId === agentId) queuedClaimDeferrals.delete(runId);
+    }
     const existing = await getAgent(agentId);
     if (!existing) return;
 
@@ -20187,6 +20184,8 @@ export function heartbeatService(
   ): Promise<number> {
     if (globalRoom <= 0) return 0;
     let count = 0;
+    let expensiveChecks = 0;
+    const maxExpensiveChecks = Math.max(globalRoom * 4, 16);
     let cursor: { id: string; createdAt: string } | null = null;
     const runningRows = await db.select({
       agentId: heartbeatRuns.agentId, count: sql<number>`count(*)`,
@@ -20199,7 +20198,8 @@ export function heartbeatService(
       executionRunId: string | null; checkoutRunId: string | null; dependencyBlocked: boolean;
     }>();
     // Lookback bounds each fetch, not eligibility: paginate past rejected rows.
-    while (true) {
+    // Fetch lazily, and bound identity/recovery work even on an unhealthy tail.
+    while (count < globalRoom && expensiveChecks < maxExpensiveChecks) {
       const older: Array<QueuedRunIdentity & Pick<typeof heartbeatRuns.$inferSelect,
         "createdAt" | "runnerProfileJson" | "nativeIssueId"> & { cursorCreatedAt: string }> = await db.select({
         id: heartbeatRuns.id,
@@ -20288,14 +20288,22 @@ export function heartbeatService(
                 (eligibility.dependencyBlocked &&
                   !allowsIssueInteractionWake(context, ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS))) continue;
           }
+          if (expensiveChecks >= maxExpensiveChecks) return count;
+          expensiveChecks += 1;
           await resolveQueuedRunResponsibleUserId(run, context);
           if (issueId && run.invocationSource === "automation") {
             // Advisory reads only; claim repeats these under admission locks.
-            if (readChatControlRecoveryAdmission(run) === "invalid") continue;
+            if (readChatControlRecoveryAdmission(run) === "invalid") {
+              rememberQueuedClaimDeferral(run, "mirror:invalid_recovery_admission");
+              continue;
+            }
             const proof = await readChatControlRecoveryStop(db, {
               companyId: run.companyId, issueId, agentId: run.agentId, sourceRunId: run.id,
             });
-            if (proof.kind !== "clear") continue;
+            if (proof.kind !== "clear") {
+              rememberQueuedClaimDeferral(run, `mirror:recovery_${proof.kind}`);
+              continue;
+            }
           }
           remainingByAgent.set(run.agentId, remaining - 1);
           count += 1;
@@ -20303,6 +20311,9 @@ export function heartbeatService(
           if (count >= globalRoom) return count;
         } catch (err) {
           if (err instanceof TypeError || err instanceof ReferenceError) throw err;
+          if (isDeferrableClaimRejection(err) && err.status !== 403) {
+            rememberQueuedClaimDeferral(run, `mirror:http_${err.status}:${err.message}`);
+          }
           logger.warn({ runId: run.id, errorClass: err instanceof Error ? err.name : typeof err },
             "queued heartbeat fairness eligibility failed; skipping reservation");
         }
@@ -20351,21 +20362,34 @@ export function heartbeatService(
 
   async function startNextQueuedRunForAgent(agentId: string) {
     const cutoff = await getWorktreeExecutionCutoff();
-    const [oldest] = await db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
-      .from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
-      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
-    const logNoClaim = (reason: string, detail: Record<string, unknown> = {}) =>
-      logStartNoClaim(agentId, oldest, cutoff, reason, detail);
-    if ((await getSchedulingSuppression()).suppressed) {
-      logNoClaim("suppression");
-      return [];
-    }
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.
     const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
 
     return withAgentStartLock(agentId, async () => {
+      const queuedRuns = await db
+        .select({
+          ...getTableColumns(heartbeatRuns),
+          fairnessCreatedAt: sql<string>`${heartbeatRuns.createdAt}::text`,
+          // Database order preserves microseconds and UUID ties for the shortcut
+          // without changing the existing dependency/priority comparator.
+          fairnessOrder: sql<number>`row_number() over (order by ${heartbeatRuns.createdAt}, ${heartbeatRuns.id})`.mapWith(Number),
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "queued"),
+            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+          ),
+        )
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+      const logNoClaim = (reason: string, detail: Record<string, unknown> = {}) =>
+        logStartNoClaim(agentId, queuedRuns[0], cutoff, reason, detail);
+      if ((await getSchedulingSuppression()).suppressed) {
+        logNoClaim("suppression");
+        return [];
+      }
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -20427,23 +20451,6 @@ export function heartbeatService(
         return [];
       }
 
-      const queuedRuns = await db
-        .select({
-          ...getTableColumns(heartbeatRuns),
-          fairnessCreatedAt: sql<string>`${heartbeatRuns.createdAt}::text`,
-          // Database order preserves microseconds and UUID ties for the shortcut
-          // without changing the existing dependency/priority comparator.
-          fairnessOrder: sql<number>`row_number() over (order by ${heartbeatRuns.createdAt}, ${heartbeatRuns.id})`.mapWith(Number),
-        })
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-          ),
-        )
-        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
       if (queuedRuns.length === 0) {
         // With a cutoff armed this exit can mean queued runs exist but all sit
         // outside the worktree cutoff window; name that reason explicitly.
@@ -20531,16 +20538,13 @@ export function heartbeatService(
           runtimeEnv[HEARTBEAT_GLOBAL_CLAIM_FAIRNESS_ENV],
         );
       let fairnessBlockedFromOrder: number | null = null;
-      let claimAttempts = 0;
-      const maxClaimAttempts = Math.max(availableSlots * 2, 3);
-      const remainingHaveSameDeferral = (index: number, runId: string) => {
-        const marker = queuedClaimDeferral(runId);
-        return marker && prioritizedRuns.slice(index + 1).every(run =>
-          queuedClaimDeferral(run.id)?.reason === marker.reason);
-      };
+      let failedAttempts = 0;
       let fairnessBlocked = false;
-      for (const [index, queuedRun] of prioritizedRuns.entries()) {
-        if (claimedRuns.length >= availableSlots || claimAttempts >= maxClaimAttempts) break;
+      for (const queuedRun of prioritizedRuns) {
+        if (claimedRuns.length >= availableSlots || failedAttempts >= 3) break;
+        // Marked heads consume no attempt budget; successive sweeps progress
+        // toward healthy work farther down the same agent's queue.
+        if (queuedClaimDeferral(queuedRun.id)) continue;
         if (claimFairnessActive) {
           const candidateOrder = queuedRun.fairnessOrder;
           // Monotone shortcut: the strictly-older competitor set only grows
@@ -20572,9 +20576,9 @@ export function heartbeatService(
         }
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
-          claimAttempts += 1;
           claimed = await claimQueuedRun(queuedRun, companyAgents);
         } catch (err) {
+          failedAttempts += 1;
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
             continue;
@@ -20584,11 +20588,10 @@ export function heartbeatService(
             { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
             "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
           );
-          if (remainingHaveSameDeferral(index, queuedRun.id)) break;
           continue;
         }
         if (claimed) claimedRuns.push(claimed);
-        else if (remainingHaveSameDeferral(index, queuedRun.id)) break;
+        else failedAttempts += 1;
       }
       if (claimedRuns.length === 0) {
         logNoClaim(
@@ -30111,6 +30114,7 @@ export function heartbeatService(
       const cancelled = cancellation.run;
 
       if (cancellation.updated && cancelled) {
+        queuedClaimDeferrals.delete(run.id);
         await setWakeupStatus(run.wakeupRequestId, "cancelled", {
           finishedAt: cancelled.finishedAt ?? new Date(),
           error: reason,
