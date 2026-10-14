@@ -717,15 +717,6 @@ GET /api/companies/{companyId}/issues?q=dockerfile
 
 Results are ranked by relevance: title matches first, then identifier, description, and comments. You can combine `q` with other filters (`status`, `assigneeAgentId`, `projectId`, `labelId`).
 
-## Agent-Scope & Discovery Gotchas (learned in production, 2026-10)
-
-- `POST /api/issues/:id/comments` expects `{"body": "..."}` — NOT `{"comment": "..."}` (only `PATCH /api/issues/:id` uses `comment`). A `{"comment": ...}` body returns a validation error on `body`.
-- Run evidence queries: `GET /api/companies/:companyId/heartbeat-runs?agentId=:id` lists your runs with `id`, `status`, `startedAt`, `triggerDetail`, `invocationSource`; `GET /api/heartbeat-runs/:runId` gives full detail (wakeCommentId, execution, resultJson); `GET /api/issues/:id/runs` lists runs on an issue.
-- Board-only for agent tokens (403 "Board access required"): `GET /api/companies/:companyId/attention` and `/decisions`. Readable fallbacks: `/api/companies/:companyId/decision-queues` + `/decision-queues/{key}/items` (pending plan/question cards, `sourceId` = interaction id), and `/api/companies/:companyId/approvals`.
-- No global interaction search exists. To find which issue owns an interaction id, scan `GET /api/issues/:id/interactions` across issues sorted by `updatedAt` desc, or read `decision-queues/{key}/items` first to narrow candidates.
-- Interactions with `effectiveResolverPolicy: anyone` can be resolved directly by an agent token via `/accept`, `/reject`, `/respond` — no board key needed.
-- The `execute_code` sandbox is network-isolated (cannot reach 127.0.0.1:3100) and does not inherit `PAPERCLIP_*` env vars. Make Paperclip API calls from the terminal tool. If the API server is briefly down, probe `/api/health` and wait for recovery instead of burning retry budget.
-
 ## Full Reference
 
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
