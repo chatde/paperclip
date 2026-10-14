@@ -2226,16 +2226,15 @@ function protectStagesFromAgentEdit(
 // explicit provider (ignoring "auto"), else the vendor in a "vendor/model" id, else a
 // model-prefix hint, else the adapter type. Hint values name the underlying vendor so a
 // Hermes agent on an OpenAI model and a Codex seat count as the same provider.
+// Only adapters that talk to exactly one vendor belong here. Harnesses that pick the
+// vendor per agent from a vendor/model id (cursor, opencode_local, pi_local, acpx,
+// paperclip_runner, hermes_*) resolve from provider/model below.
 const adapterProviderFamily: Record<string, string> = {
   claude_local: "anthropic",
   codex_local: "openai",
   grok_local: "xai",
   gemini_local: "gemini",
   kimi_local: "kimi",
-  cursor_local: "cursor",
-  cursor_cloud: "cursor",
-  opencode_local: "opencode",
-  pi_local: "pi",
 };
 const reviewModelProviderHints: [string, string][] = [
   ["mimo", "xiaomi"],
