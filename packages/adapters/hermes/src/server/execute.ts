@@ -54,6 +54,10 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import {
+  readHermesSessionUsage,
+  resolveHermesStateDbPath,
+} from "./session-usage.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -616,8 +620,29 @@ export async function execute(
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
   }
 
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
+  // ── Token metering (TOP-599) ──────────────────────────────────────────────
+  // Hermes records cumulative per-session usage counters in its SQLite
+  // session store ($HERMES_HOME/state.db). Report those totals (the server
+  // session-deltas consecutive runs of the same session) so the cost ledger
+  // attributes prompt/completion tokens to this agent and provider. The
+  // stdout regex above remains the fallback when the store is unreadable.
+  const meteringSessionId = parsed.sessionId ?? prevSessionId ?? null;
+  const stateUsage = meteringSessionId
+    ? readHermesSessionUsage(resolveHermesStateDbPath(env), meteringSessionId)
+    : null;
+  const usage: UsageSummary | undefined = stateUsage
+    ? {
+        inputTokens: stateUsage.inputTokens,
+        outputTokens: stateUsage.outputTokens,
+        cachedInputTokens: stateUsage.cachedInputTokens,
+      }
+    : parsed.usage;
+
+  if (usage) {
+    executionResult.usage = usage;
+    if (stateUsage) {
+      executionResult.usageBasis = "session_cumulative";
+    }
   }
 
   if (parsed.costUsd !== undefined) {
@@ -633,7 +658,7 @@ export async function execute(
   executionResult.resultJson = {
     result: parsed.response || "",
     session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
+    usage: usage || null,
     cost_usd: parsed.costUsd ?? null,
   };
 
