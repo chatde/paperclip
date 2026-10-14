@@ -31,6 +31,7 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
   hasPermission: vi.fn(async () => false),
 }));
+const mockAgentGetById = vi.hoisted(() => vi.fn());
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   for: () => ({
     then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
@@ -89,11 +90,7 @@ function registerModuleMocks() {
     }),
     accessService: () => mockAccessService,
     agentService: () => ({
-      getById: vi.fn(async (agentId: string) => ({
-        id: agentId,
-        companyId: "company-1",
-        permissions: null,
-      })),
+      getById: mockAgentGetById,
       resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
         ambiguous: false,
         agent: {
@@ -203,6 +200,15 @@ describe("issue execution policy routes", () => {
     vi.doUnmock("../middleware/index.js");
     registerModuleMocks();
     vi.clearAllMocks();
+    mockAgentGetById.mockImplementation(async (agentId: string) => ({
+      id: agentId,
+      companyId: "company-1",
+      permissions: null,
+      adapterType: "paperclip_runner",
+      adapterConfig: {
+        provider: agentId === "33333333-3333-4333-8333-333333333333" ? "codex" : "claude",
+      },
+    }));
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockIssueService.getByIdForUpdate.mockImplementation(async () => mockIssueService.getById());
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
@@ -263,6 +269,180 @@ describe("issue execution policy routes", () => {
       };
     });
     mockAccessService.hasPermission.mockResolvedValue(false);
+  });
+
+  describe("agent review gate protection", () => {
+    const workerId = "33333333-3333-4333-8333-333333333333";
+    const reviewerId = "44444444-4444-4444-8444-444444444444";
+    const agent: TestActor = {
+      type: "agent",
+      agentId: workerId,
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    };
+
+    function setupIssue(gated = true) {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+      })!;
+      const issue = {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status: "in_progress",
+        assigneeAgentId: workerId,
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "TOP-521",
+        title: "Gated issue",
+        executionPolicy: gated ? policy : null,
+        executionState: null,
+      };
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+      return { issue, policy };
+    }
+
+    it.each([
+      ["null policy", null],
+      ["empty stages", { stages: [] }],
+      ["different participants", { stages: [{ type: "review", participants: [{ type: "agent", agentId: workerId }] }] }],
+      ["different stage type", { stages: [{ type: "approval", participants: [{ type: "agent", agentId: reviewerId }] }] }],
+    ])("rejects an agent's %s without changing stored stages", async (_name, executionPolicy) => {
+      const { issue, policy } = setupIssue();
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Agents cannot change or remove review or approval stages");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(issue.executionPolicy).toEqual(policy);
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("preserves stages and applies an agent's monitor-only update", async () => {
+      const { issue, policy } = setupIssue();
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: { monitor: {
+          nextCheckAt: "2026-12-01T12:00:00.000Z",
+          notes: "Check the build",
+          scheduledBy: "board",
+        } } });
+
+      expect(res.status).toBe(200);
+      expect(res.body.executionPolicy.stages).toEqual(policy.stages);
+      expect(res.body.executionPolicy.monitor).toMatchObject({
+        nextCheckAt: "2026-12-01T12:00:00.000Z",
+        notes: "Check the build",
+        scheduledBy: "assignee",
+      });
+      expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({
+        executionPolicy: { stages: policy.stages },
+        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
+      });
+    });
+
+    it("keeps stored stage identities when agents resubmit equivalent stages", async () => {
+      const { issue, policy } = setupIssue();
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: {
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerId }] }],
+        } });
+
+      expect(res.status).toBe(200);
+      expect(res.body.executionPolicy.stages).toEqual(policy.stages);
+    });
+
+    it("allows the board to replace stages with a same-provider pool", async () => {
+      const { issue } = setupIssue();
+      const replacement = normalizeIssueExecutionPolicy({
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: workerId }] }],
+      })!;
+      const res = await request(await createApp())
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: replacement });
+
+      expect(res.status).toBe(200);
+      expect(res.body.executionPolicy.stages).toEqual(replacement.stages);
+    });
+
+    it.each([true, false])("rejects an explicitly submitted same-provider pool (stored gate: %s)", async (gated) => {
+      const { issue, policy } = setupIssue(gated);
+      mockAgentGetById.mockImplementation(async (agentId: string) => ({
+        id: agentId, companyId: "company-1", permissions: null,
+        adapterType: "paperclip_runner", adapterConfig: { provider: "codex" },
+      }));
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: policy });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Review stage must include a reviewer on a different provider than the assignee");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("uses adapterType when provider is absent", async () => {
+      const { issue, policy } = setupIssue();
+      mockAgentGetById.mockImplementation(async (agentId: string) => ({
+        id: agentId, companyId: "company-1", permissions: null,
+        adapterType: "codex_local", adapterConfig: {},
+      }));
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: policy });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("Review stage must include a reviewer on a different provider than the assignee");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it.each(["agent", "user"])("allows a pool with an independent %s participant", async (type) => {
+      const { issue } = setupIssue(false);
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: { stages: [{ type: "review", participants: [
+          { type: "agent", agentId: workerId },
+          type === "agent" ? { type, agentId: reviewerId } : { type, userId: "local-board" },
+        ] }] } });
+
+      expect(res.status).toBe(200);
+      expect(res.body.executionPolicy.stages[0].participants).toHaveLength(2);
+    });
+
+    it("preserves a board-configured same-provider gate on monitor-only updates", async () => {
+      const { issue, policy } = setupIssue();
+      mockAgentGetById.mockImplementation(async (agentId: string) => ({
+        id: agentId, companyId: "company-1", permissions: null,
+        adapterType: "codex_local", adapterConfig: {},
+      }));
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: { monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" } } });
+
+      expect(res.status).toBe(200);
+      expect(res.body.executionPolicy.stages).toEqual(policy.stages);
+    });
+
+    it("reroutes an agent's done request to the gated reviewer", async () => {
+      const { issue, policy } = setupIssue();
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ status: "done" });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: reviewerId,
+        executionPolicy: policy,
+        executionState: { status: "pending", currentStageId: policy.stages[0]!.id },
+      });
+    });
   });
 
   it("reauthorizes a terminal verdict against the review policy held under the update lock", async () => {

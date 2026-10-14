@@ -2197,19 +2197,20 @@ function stageSignature(stages: NonNullable<NormalizedExecutionPolicy>["stages"]
 /**
  * Review/approval stages are a gate on the worker, so the worker must not be able to edit them.
  * For agent actors the stored stages always win: a body that omits `stages` (for example a
- * monitor-only policy) or is null keeps them, and a body that sends different `stages` is rejected.
+ * monitor-only policy) keeps them. Explicit removal or different `stages` is rejected.
  */
 function protectStagesFromAgentEdit(
-  stored: NormalizedExecutionPolicy,
-  requested: NormalizedExecutionPolicy,
+  stored: NormalizedExecutionPolicy | null,
+  requested: NormalizedExecutionPolicy | null,
   rawPolicy: unknown,
-): NormalizedExecutionPolicy {
+): NormalizedExecutionPolicy | null {
   if (!stored || stored.stages.length === 0) return requested;
   const bodyHasStages =
     typeof rawPolicy === "object" && rawPolicy !== null && "stages" in rawPolicy;
   if (
-    bodyHasStages &&
-    stageSignature(requested?.stages ?? []) !== stageSignature(stored.stages)
+    rawPolicy === null ||
+    (bodyHasStages &&
+      stageSignature(requested?.stages ?? []) !== stageSignature(stored.stages))
   ) {
     throw forbidden("Agents cannot change or remove review or approval stages");
   }
@@ -2217,6 +2218,39 @@ function protectStagesFromAgentEdit(
     ...(requested ?? { mode: stored.mode, commentRequired: true }),
     stages: stored.stages,
   };
+}
+
+async function assertReviewProviderDiversity(
+  agentsSvc: ReturnType<typeof agentService>,
+  companyId: string,
+  assigneeAgentId: string | null,
+  policy: NormalizedExecutionPolicy | null,
+) {
+  const reviewStages = policy?.stages.filter(
+    (stage) => stage.type === "review" &&
+      stage.participants.every((participant) => participant.type === "agent"),
+  ) ?? [];
+  if (!assigneeAgentId || reviewStages.length === 0) return;
+  const providers = new Map<string, Promise<string | null>>();
+  const providerFor = (agentId: string) => {
+    if (!providers.has(agentId)) {
+      providers.set(agentId, agentsSvc.getById(agentId).then((agent) => {
+        if (!agent || agent.companyId !== companyId) return null;
+        return readNonEmptyString(agent.adapterConfig?.provider) ?? agent.adapterType;
+      }));
+    }
+    return providers.get(agentId)!;
+  };
+  const assigneeProvider = await providerFor(assigneeAgentId);
+  if (!assigneeProvider) return;
+  for (const stage of reviewStages) {
+    const reviewerProviders = await Promise.all(stage.participants.map(
+      (participant) => participant.agentId ? providerFor(participant.agentId) : null,
+    ));
+    if (reviewerProviders.every((provider) => provider === assigneeProvider)) {
+      throw forbidden("Review stage must include a reviewer on a different provider than the assignee");
+    }
+  }
 }
 
 async function assertCanManageIssueMonitor(
@@ -12764,6 +12798,11 @@ export function issueRoutes(
 
   router.patch(
     "/issues/:id",
+    (req, res, next) => {
+      // Validation defaults omitted stages to []; retain omission intent for the gate.
+      res.locals.rawIssueExecutionPolicy = req.body?.executionPolicy;
+      next();
+    },
     validateIssueMutationBody(updateIssueRouteSchema),
     async (req, res) => {
       const id = req.params.id as string;
@@ -13147,11 +13186,23 @@ export function issueRoutes(
             ? protectStagesFromAgentEdit(
                 normalizeIssueExecutionPolicy(existing.executionPolicy ?? null),
                 requestedExecutionPolicy,
-                req.body.executionPolicy,
+                res.locals.rawIssueExecutionPolicy,
               )
             : requestedExecutionPolicy,
           actor.actorType,
         );
+        const rawPolicy = res.locals.rawIssueExecutionPolicy;
+        if (
+          req.actor.type === "agent" &&
+          rawPolicy && typeof rawPolicy === "object" && "stages" in rawPolicy
+        ) {
+          await assertReviewProviderDiversity(
+            agentsSvc,
+            existing.companyId,
+            requestedAssigneeAgentId,
+            updateFields.executionPolicy as NormalizedExecutionPolicy | null,
+          );
+        }
       }
       const previousExecutionPolicy = normalizeIssueExecutionPolicy(
         existing.executionPolicy ?? null,
