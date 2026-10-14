@@ -269,6 +269,86 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Diagnosable error capture (TOP-596)
+// ---------------------------------------------------------------------------
+
+/**
+ * TOP-596: run.error must carry the diagnosable tail of a failure. Traceback
+ * tails are bounded to the last 4KB (last frames + exception line); a
+ * non-zero exit without a parsed error keeps a bounded tail of each output
+ * stream (last 4KB per stream, ~8KB total).
+ */
+const ERROR_TAIL_MAX_BYTES = 4096;
+
+/** Marker left where the head of a bounded tail was dropped. */
+const TAIL_ELISION_MARKER = "[... earlier output elided ...]";
+
+const BARE_TRACEBACK_HEADER_LINE = /^\s*Traceback \(most recent call last\):\s*$/;
+
+/** True for lines that carry no diagnostic value in an error tail. */
+function isBenignErrorTailLine(line: string): boolean {
+  const t = line.trim();
+  if (!t) return true;
+  if (/^session[_ ](?:id|saved)[:\s]/i.test(t)) return true;
+  if (t.startsWith("[hermes]") || t.startsWith("[paperclip]") || t.startsWith("[tool]")) return true;
+  if (/^\[?\d{4}[-/]\d{2}[-/]?\d{2}T/.test(t)) return true;
+  if (/^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(t)) return true;
+  return false;
+}
+
+/**
+ * Keep the last `maxBytes` of `text`, cutting at a line boundary and
+ * prefixing an elision marker when the head was dropped.
+ */
+function boundedTail(text: string, maxBytes: number): string {
+  const trimmed = text.replace(/\s+$/, "");
+  if (!trimmed) return "";
+  if (trimmed.length <= maxBytes) return trimmed;
+  const slice = trimmed.slice(trimmed.length - maxBytes);
+  const firstNewline = slice.indexOf("\n");
+  const cut = firstNewline >= 0 ? slice.slice(firstNewline + 1) : slice;
+  return `${TAIL_ELISION_MARKER}\n${cut}`;
+}
+
+/**
+ * TOP-596 class 4: tail of the last Python traceback block in `text` — the
+ * last frames plus the final exception line, bounded to the last
+ * ERROR_TAIL_MAX_BYTES bytes. Returns null when no traceback block exists.
+ */
+function extractTracebackTail(text: string): string | null {
+  const headerIdx = text.lastIndexOf("Traceback (most recent call last):");
+  if (headerIdx < 0) return null;
+  return boundedTail(text.slice(headerIdx), ERROR_TAIL_MAX_BYTES) || null;
+}
+
+/**
+ * TOP-596 class 1: bounded stderr/stdout tails for a non-zero exit that
+ * produced no parsed error line. Hermes writes the failure body to stdout in
+ * some families (e.g. provider quota errors) and to stderr in others, so both
+ * streams are captured with benign noise removed.
+ */
+function buildDiagnosableOutputTail(stdout: string, stderr: string): string {
+  const sections: string[] = [];
+  const stderrTail = boundedTail(
+    stderr
+      .split("\n")
+      .filter((line) => !isBenignErrorTailLine(line))
+      .join("\n"),
+    ERROR_TAIL_MAX_BYTES,
+  );
+  if (stderrTail) sections.push(`--- stderr tail ---\n${stderrTail}`);
+  const stdoutTail = boundedTail(
+    stdout
+      .split("\n")
+      .filter((line) => !isBenignErrorTailLine(line))
+      .join("\n"),
+    ERROR_TAIL_MAX_BYTES,
+  );
+  if (stdoutTail) sections.push(`--- stdout tail ---\n${stdoutTail}`);
+  return sections.join("\n");
+}
+
 function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
@@ -316,6 +396,15 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 
   // Check for error patterns in stderr
   if (stderr.trim()) {
+    // TOP-596 class 4: keep the diagnosable tail of a Python traceback (last
+    // frames + the final exception line) instead of collapsing it to a single
+    // matched line or the bare header. The tail is the reason; the header is
+    // not.
+    const tracebackTail = extractTracebackTail(stderr);
+    if (tracebackTail) {
+      result.errorMessage = tracebackTail;
+      return result;
+    }
     const errorLines = stderr
       .split("\n")
       .filter((line) => /error|exception|traceback|failed/i.test(line))
@@ -326,9 +415,8 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
       // one match — the header alone is not a reason, while the last matching
       // line is the actual exception. Keep the header only when it is the
       // sole match (genuine non-timeout crash where it is all we have).
-      const bareTracebackHeader = /^\s*Traceback \(most recent call last\):\s*$/;
       if (errorLines.length > 1) {
-        const nonHeader = errorLines.filter((line) => !bareTracebackHeader.test(line));
+        const nonHeader = errorLines.filter((line) => !BARE_TRACEBACK_HEADER_LINE.test(line));
         result.errorMessage = nonHeader.at(-1) ?? errorLines.at(-1) ?? errorLines[0] ?? "";
       } else {
         result.errorMessage = errorLines.slice(0, 5).join("\n");
@@ -613,7 +701,13 @@ export async function execute(
   } else if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
   } else if (typeof result.exitCode === "number" && result.exitCode !== 0) {
-    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+    // TOP-596 class 3: "Hermes exited with code N" alone is undiagnosable.
+    // Attach the bounded stderr/stdout tail so run.error carries the failure
+    // body (some failure families write it to stdout, others to stderr).
+    const outputTail = buildDiagnosableOutputTail(result.stdout ?? "", result.stderr ?? "");
+    executionResult.errorMessage = outputTail
+      ? `Hermes exited with code ${result.exitCode}\n${outputTail}`
+      : `Hermes exited with code ${result.exitCode}`;
   }
 
   if (parsed.usage) {

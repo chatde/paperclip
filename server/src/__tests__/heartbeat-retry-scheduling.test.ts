@@ -290,6 +290,47 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(1);
   });
 
+  it("TOP-596 stops the transient lane after the second identical failure (no new information)", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "adapter_failed" });
+    const identicalError = "Hermes exited with code 1\n--- stdout tail ---\nHTTP 429 quota exceeded. Retry in 32.44s";
+    await db.update(heartbeatRuns).set({ error: identicalError }).where(eq(heartbeatRuns.id, runId));
+    const first = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 });
+    expect(first).toMatchObject({ outcome: "scheduled", run: { scheduledRetryAttempt: 1 } });
+    if (first.outcome !== "scheduled") throw new Error("Expected a bounded retry");
+    expect(first.run.contextSnapshot?.identicalFailureChain).toMatchObject({ chainCount: 1 });
+    // The retry reproduces the same failure verbatim apart from volatile digits.
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      error: "Hermes exited with code 1\n--- stdout tail ---\nHTTP 429 quota exceeded. Retry in 47.1s",
+      errorCode: "adapter_failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    }).where(eq(heartbeatRuns.id, first.run.id));
+    const second = await heartbeat.scheduleBoundedRetry(first.run.id, { now, random: () => 0 });
+    expect(second).toMatchObject({ outcome: "not_scheduled", errorCode: "identical_repeated_failure" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, first.run.id))).toHaveLength(0);
+  });
+
+  it("TOP-596 a different failure signature restarts the chain and keeps the transient ceiling", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
+    const now = new Date("2026-04-20T12:00:00.000Z");
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "adapter_failed" });
+    await db.update(heartbeatRuns).set({ error: "Hermes exited with code 1" }).where(eq(heartbeatRuns.id, runId));
+    const first = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 });
+    if (first.outcome !== "scheduled") throw new Error("Expected a bounded retry");
+    await db.update(heartbeatRuns).set({
+      status: "failed",
+      error: "Traceback (most recent call last):\nKeyboardInterrupt",
+      errorCode: "adapter_failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    }).where(eq(heartbeatRuns.id, first.run.id));
+    const second = await heartbeat.scheduleBoundedRetry(first.run.id, { now, random: () => 0 });
+    expect(second).toMatchObject({ outcome: "scheduled", run: { scheduledRetryAttempt: 2 } });
+    if (second.outcome !== "scheduled") throw new Error("Expected a bounded retry");
+    expect(second.run.contextSnapshot?.identicalFailureChain).toMatchObject({ chainCount: 1 });
+  });
+
   it.each([
     ["workspace_busy", "failureRetriesBeforeWorkspaceWait"],
     ["ai_connection_busy", "failureRetriesBeforeAiConnectionWait"],

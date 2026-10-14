@@ -126,7 +126,7 @@ describe("hermes-local adapter timeout errorReason (TOP-396)", () => {
     expect(result.timedOut).toBe(true);
   });
 
-  it("keeps the real error line for a genuine crash (last matching line over the bare header)", async () => {
+  it("keeps the traceback tail for a genuine crash (last frames + exception line, TOP-596)", async () => {
     mockChild({
       exitCode: 1,
       signal: null,
@@ -139,10 +139,16 @@ describe("hermes-local adapter timeout errorReason (TOP-396)", () => {
       ].join("\n"),
     });
     const result = await execute(makeCtx());
-    expect(result.errorMessage).toBe("ValueError: boom");
+    expect(result.errorMessage).toBe(
+      [
+        BARE_TRACEBACK_HEADER,
+        '  File "cli.py", line 12, in <module>',
+        "ValueError: boom",
+      ].join("\n"),
+    );
   });
 
-  it("keeps the bare traceback head when it is the only matching line (genuine non-timeout crash)", async () => {
+  it("keeps the traceback tail when no exception line matched (genuine non-timeout crash, TOP-596)", async () => {
     mockChild({
       exitCode: 1,
       signal: null,
@@ -150,6 +156,8 @@ describe("hermes-local adapter timeout errorReason (TOP-396)", () => {
       stderr: `${BARE_TRACEBACK_HEADER}\n  File "cli.py", line 12, in <module>\n`,
     });
     const result = await execute(makeCtx());
-    expect(result.errorMessage).toBe(BARE_TRACEBACK_HEADER);
+    expect(result.errorMessage).toBe(
+      `${BARE_TRACEBACK_HEADER}\n  File "cli.py", line 12, in <module>`,
+    );
   });
 });

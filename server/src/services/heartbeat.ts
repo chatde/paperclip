@@ -51,7 +51,7 @@ import {
   registerAdapterExecutionControl,
   waitForAdapterStop,
 } from "./adapter-execution-control.js";
-import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
+import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry, failureSignature, readIdenticalFailureChain, extendIdenticalFailureChain, IDENTICAL_FAILURE_TERMINAL_COUNT } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -15502,6 +15502,45 @@ export function heartbeatService(
       }
     }
 
+    // TOP-596: a retry is only useful when it can carry new information. When
+    // consecutive runs fail with the same signature (normalized run.error +
+    // errorCode), further transient-lane retries repeat the same outcome
+    // (e.g. the 2026-10-13 "Hermes exited with code 1" chains that burned the
+    // transient ceiling), so the chain settles terminal after
+    // IDENTICAL_FAILURE_TERMINAL_COUNT identical failures. A different
+    // failure signature restarts the chain and keeps the normal ceiling.
+    const identicalFailureChain = extendIdenticalFailureChain(
+      readIdenticalFailureChain(contextSnapshot.identicalFailureChain),
+      failureSignature(run.error, run.errorCode),
+    );
+    if (
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+      run.status === "failed" &&
+      identicalFailureChain &&
+      identicalFailureChain.chainCount >= IDENTICAL_FAILURE_TERMINAL_COUNT
+    ) {
+      const identity = {
+        retryReason,
+        scheduledRetryAttempt: nextAttempt,
+        maxAttempts,
+        identicalFailureChain,
+      };
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "warn",
+        message: `Identical failure repeated on ${identicalFailureChain.chainCount} consecutive runs; the retry would carry no new information, so no further automatic retry will be queued`,
+        payload: identity,
+        retryExhaustion: identity,
+      });
+      return {
+        outcome: "not_scheduled" as const,
+        reason: `Identical failure repeated on ${identicalFailureChain.chainCount} consecutive runs; no further automatic retry will be queued`,
+        errorCode: "identical_repeated_failure" as const,
+        issueId,
+      };
+    }
+
     const schedule =
       transientRetryNotBefore &&
       transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
@@ -15579,6 +15618,9 @@ export function heartbeatService(
       {
         ...contextSnapshot,
         executionRetryAccounting: accountingForScheduledRetry(run, retryReason, schedule.attempt),
+        // TOP-596: the failure signature chain is stamped so the successor can
+        // decide whether an identical repeat is worth another retry.
+        ...(identicalFailureChain ? { identicalFailureChain } : {}),
         retryOfRunId: run.id,
         wakeReason,
         retryReason,

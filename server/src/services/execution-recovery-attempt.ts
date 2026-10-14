@@ -70,3 +70,73 @@ export function accountingForScheduledRetry(run: RetryRun, reason: string, attem
   else if (reason !== "workspace_busy" && reason !== "ai_connection_busy") accounting.failureRetries = attempt;
   return accounting;
 }
+
+// ---------------------------------------------------------------------------
+// Identical-failure chain (TOP-596)
+// ---------------------------------------------------------------------------
+
+/** Consecutive identical failures after which an automatic retry is terminal. */
+export const IDENTICAL_FAILURE_TERMINAL_COUNT = 2;
+
+/**
+ * Normalized signature of a run failure (TOP-596). Digit runs collapse to
+ * "#", so volatile detail (retry countdowns, line numbers, ids) does not
+ * split the chain, while genuinely different failures keep different
+ * signatures. The tail is kept because that is where the diagnosable reason
+ * lives; the head is where the stable error family lives. Null when the run
+ * carried no error at all.
+ */
+export function failureSignature(error: unknown, errorCode: unknown): string | null {
+  const code =
+    typeof errorCode === "string" && errorCode.trim() ? errorCode.trim() : null;
+  const text = typeof error === "string" ? error : "";
+  const normalized = text
+    .toLowerCase()
+    .replace(/\d+/g, "#")
+    .replace(/\s+/g, " ")
+    .trim();
+  const tail = normalized.slice(-512);
+  if (!code && !tail) return null;
+  return JSON.stringify([code, tail]);
+}
+
+export interface IdenticalFailureChain {
+  version: 1;
+  signature: string;
+  /** Consecutive identical failures ending at the stamped run. */
+  chainCount: number;
+}
+
+export function readIdenticalFailureChain(value: unknown): IdenticalFailureChain | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const saved = value as Record<string, unknown>;
+  const signature = saved.signature;
+  const chainCount = saved.chainCount;
+  if (
+    saved.version !== 1 ||
+    typeof signature !== "string" ||
+    !signature ||
+    !(typeof chainCount === "number" && Number.isSafeInteger(chainCount) && chainCount >= 1)
+  ) {
+    return null;
+  }
+  return { version: 1, signature, chainCount };
+}
+
+/**
+ * Extend the identical-failure chain with the current run's signature: the
+ * chain grows only while consecutive runs fail identically; any new signature
+ * restarts it at 1. Returns null when the run carried no signature.
+ */
+export function extendIdenticalFailureChain(
+  previous: IdenticalFailureChain | null,
+  signature: string | null,
+): IdenticalFailureChain | null {
+  if (!signature) return null;
+  return {
+    version: 1,
+    signature,
+    chainCount:
+      previous && previous.signature === signature ? previous.chainCount + 1 : 1,
+  };
+}
