@@ -53,6 +53,10 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
+import {
+  extractHermesFailureReason,
+  classifyHermesFailure,
+} from "./classify.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 // ---------------------------------------------------------------------------
@@ -608,12 +612,37 @@ export async function execute(
   // last):" header to stderr error matching. Timeout diagnostics stay with
   // the heartbeat timeout path, which stores the classified "timed out after
   // Ns (run budget exceeded)" reason instead of a raw traceback head.
+  //
+  // TOP-684: the hermes CLI reports its own terminal failures (provider quota,
+  // upstream overload, setup fatals) on *stdout*, which parseHermesOutput's
+  // stderr-only scan misses. Recover that reason from the combined stream so a
+  // failed run surfaces its real cause instead of "Hermes exited with code N",
+  // and route provider quota / transient upstream causes into their own recovery
+  // buckets instead of the generic adapter_failed.
+  const failed =
+    !result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0;
+  const failureReason = extractHermesFailureReason(
+    result.stdout || "",
+    result.stderr || "",
+  );
+  const classification = failed ? classifyHermesFailure(failureReason) : null;
+
   if (result.timedOut) {
     // Intentionally leave errorMessage unset.
+  } else if (classification && failureReason) {
+    // Provider-side quota / transient overload: surface the provider reason and
+    // set errorCode/errorFamily so the run lands in its own recovery bucket
+    // rather than adapter_failed.
+    executionResult.errorMessage = failureReason;
+    executionResult.errorCode = classification.errorCode;
+    executionResult.errorFamily = classification.errorFamily;
   } else if (parsed.errorMessage) {
     executionResult.errorMessage = parsed.errorMessage;
-  } else if (typeof result.exitCode === "number" && result.exitCode !== 0) {
-    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+  } else if (failed) {
+    // Surface the CLI's terminal failure reason (e.g. a setup fatal) when there
+    // is no parsed crash line; fall back to the generic exit-code message.
+    executionResult.errorMessage =
+      failureReason ?? `Hermes exited with code ${result.exitCode}`;
   }
 
   if (parsed.usage) {
