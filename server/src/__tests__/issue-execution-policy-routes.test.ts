@@ -10,6 +10,8 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   createChild: vi.fn(),
+  create: vi.fn(),
+  decomposeAcceptedPlan: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
   getRelationSummaries: vi.fn(),
@@ -427,6 +429,192 @@ describe("issue execution policy routes", () => {
 
       expect(res.status).toBe(200);
       expect(res.body.executionPolicy.stages).toEqual(policy.stages);
+    });
+
+    it("accepts reordered stages and participants while retaining stored identities and order", async () => {
+      const { issue, policy } = setupIssue();
+      policy.stages[0]!.participants.push({
+        id: "66666666-6666-4666-8666-666666666666", type: "agent", agentId: workerId, userId: null,
+      });
+      policy.stages.push({
+        id: "22222222-2222-4222-8222-222222222222",
+        type: "approval",
+        approvalsNeeded: 1,
+        participants: [{
+          id: "77777777-7777-4777-8777-777777777777", type: "user", userId: "local-board", agentId: null,
+        }],
+      });
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: {
+          stages: [...policy.stages].reverse().map((stage) => ({
+            type: stage.type,
+            participants: [...stage.participants].reverse(),
+          })),
+          monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" },
+        } });
+      expect(res.status).toBe(200);
+      expect(res.body.executionPolicy.stages).toEqual(policy.stages);
+      expect(res.body.executionPolicy.monitor.nextCheckAt).toBe("2026-12-01T12:00:00.000Z");
+    });
+
+    it("rejects removal of a repeated stage rather than comparing stages as a set", async () => {
+      const { issue, policy } = setupIssue();
+      policy.stages.push({ ...policy.stages[0]!, id: "22222222-2222-4222-8222-222222222222" });
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: { stages: [policy.stages[0]] } });
+      expect(res.status).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it.each(["unknown reviewer", "cross-company reviewer", "unknown assignee", "unassigned"])(
+      "rejects an agent-set review pool with an %s",
+      async (scenario) => {
+        const { issue, policy } = setupIssue(false);
+        if (scenario === "unassigned") Object.assign(issue, { assigneeAgentId: null });
+        mockAgentGetById.mockImplementation(async (id: string) => {
+          if ((scenario === "unknown reviewer" && id === reviewerId) ||
+              (scenario === "unknown assignee" && id === workerId)) return null;
+          return {
+            id, companyId: scenario === "cross-company reviewer" && id === reviewerId ? "company-2" : "company-1",
+            permissions: null, adapterType: id === workerId ? "hermes_local" : "claude_local",
+            adapterConfig: {},
+          };
+        });
+        const res = await request(await createApp(agent))
+          .patch(`/api/issues/${issue.id}`)
+          .send({ executionPolicy: policy });
+        expect(res.status).toBe(403);
+        expect(res.body.error).toBe("Review stage must include a reviewer on a different provider than the assignee");
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      [{ provider: "XIAOMI" }, { provider: "xiaomi" }, "hermes_local", 403],
+      [{ model: "mimo-v2.6-pro" }, { provider: "xiaomi" }, "hermes_local", 403],
+      [{ provider: "AUTO", model: "MiMo-v2.6-pro" }, { provider: "xiaomi" }, "hermes_local", 403],
+      [{ model: "nvidia/nemotron" }, { provider: "NVIDIA" }, "hermes_local", 403],
+      [{ model: "MiniMax-M2.7" }, { provider: "minimax" }, "hermes_local", 403],
+      [{ model: "gemini-3-flash" }, { provider: "gemini" }, "hermes_local", 403],
+      [{ provider: "xiaomi", model: "claude-sonnet" }, { provider: "xiaomi" }, "hermes_local", 403],
+      [{ provider: "xiaomi" }, {}, "claude_local", 200],
+      [{ model: "mimo-v2.6-pro" }, {}, "claude_local", 200],
+    ])("resolves provider identity for %j and %j (%s)", async (workerConfig, reviewerConfig, reviewerAdapter, status) => {
+      const { issue, policy } = setupIssue(false);
+      mockAgentGetById.mockImplementation(async (id: string) => ({
+        id, companyId: "company-1", permissions: null,
+        adapterType: id === workerId ? "hermes_local" : reviewerAdapter,
+        adapterConfig: id === workerId ? workerConfig : reviewerConfig,
+      }));
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ executionPolicy: policy });
+      expect(res.status).toBe(status);
+      if (status === 403) expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it.each(["monitor", "null", "stages", "done"])(
+      "protects stages added by the board after the snapshot during an agent %s write",
+      async (kind) => {
+        const { issue, policy } = setupIssue(false);
+        // The board commits after getById, before the PATCH takes its row lock.
+        mockIssueService.getByIdForUpdate.mockResolvedValue({ ...issue, executionPolicy: policy });
+        const executionPolicy = kind === "null" ? null : kind === "done" ? {} : kind === "stages"
+          ? { stages: [{ type: "approval", participants: [{ type: "agent", agentId: workerId }] }] }
+          : { monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z" } };
+        const res = await request(await createApp(agent))
+          .patch(`/api/issues/${issue.id}`)
+          .send({ executionPolicy, ...(kind === "done" ? { status: "done" } : {}) });
+        expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();
+        if (kind === "monitor") {
+          expect(res.status).toBe(200);
+          expect(res.body.executionPolicy.stages).toEqual(policy.stages);
+          expect(res.body.executionPolicy.monitor.nextCheckAt).toBe("2026-12-01T12:00:00.000Z");
+          const tx = mockIssueService.getByIdForUpdate.mock.calls[0]![1];
+          expect(mockIssueService.update.mock.calls[0]![2]).toBe(tx);
+        } else {
+          expect(res.status).toBe(kind === "done" ? 409 : 403);
+          expect(mockIssueService.update).not.toHaveBeenCalled();
+        }
+      },
+    );
+
+    describe.each(["create", "children", "decomposition"])("%s provider diversity", (path) => {
+      it.each([false, true])("checks the stored assignee's provider (diverse: %s)", async (diverse) => {
+        const { issue } = setupIssue(false);
+        mockAccessService.hasPermission.mockResolvedValue(true);
+        mockAgentGetById.mockImplementation(async (id: string) => ({
+          id, companyId: "company-1", permissions: null,
+          adapterType: id === reviewerId ? "claude_local" : "hermes_local",
+          adapterConfig: id === reviewerId ? {} : { model: "mimo-v2.6-pro" },
+        }));
+        mockIssueService.create.mockImplementation(async (_companyId, input) => ({ ...input, companyId: "company-1" }));
+        mockIssueService.decomposeAcceptedPlan.mockResolvedValue({
+          decomposition: { id: "decomposition-1", status: "active" },
+          childIssueIds: [], newlyCreatedIssues: [],
+        });
+        const child = {
+          title: "Review-gated task", assigneeAgentId: workerId,
+          executionPolicy: { stages: [{ type: "review", participants: [
+            { type: "agent", agentId: diverse ? reviewerId : workerId },
+          ] }] },
+        };
+        const url = path === "create" ? "/api/companies/company-1/issues"
+          : `/api/issues/${issue.id}/${path === "children" ? "children" : "accepted-plan-decompositions"}`;
+        const body = path === "decomposition" ? {
+          acceptedPlanRevisionId: "22222222-2222-4222-8222-222222222222", children: [child],
+        } : child;
+        const res = await request(await createApp(agent)).post(url).send(body);
+        expect(res.status).toBe(diverse ? (path === "decomposition" ? 200 : 201) : 403);
+        if (!diverse) {
+          expect(res.body.error).toBe("Review stage must include a reviewer on a different provider than the assignee");
+          expect(mockIssueService.create).not.toHaveBeenCalled();
+          expect(mockIssueService.createChild).not.toHaveBeenCalled();
+          expect(mockIssueService.decomposeAcceptedPlan).not.toHaveBeenCalled();
+        }
+      });
+    });
+
+    it("uses the persisted stage identity when an agent adds a gate and completes work together", async () => {
+      const { issue } = setupIssue(false);
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ status: "done", executionPolicy: { stages: [
+          { type: "review", participants: [{ type: "agent", agentId: reviewerId }] },
+        ] } });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("in_review");
+      expect(res.body.executionState.currentStageId).toBe(res.body.executionPolicy.stages[0].id);
+    });
+
+    it.each([true, false])("keeps completion monitor clearing under the policy write lock (explicit: %s)", async (explicit) => {
+      const { issue } = setupIssue(false);
+      issue.executionPolicy = normalizeIssueExecutionPolicy({
+        monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z", scheduledBy: "assignee" },
+      });
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ status: "done", ...(explicit ? { executionPolicy: issue.executionPolicy } : {}) });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe("done");
+      expect(res.body.executionPolicy?.monitor ?? null).toBeNull();
+    });
+
+    it("does not clear concurrent board stages through implicit completion monitor cleanup", async () => {
+      const { issue, policy } = setupIssue(false);
+      issue.executionPolicy = normalizeIssueExecutionPolicy({
+        monitor: { nextCheckAt: "2026-12-01T12:00:00.000Z", scheduledBy: "assignee" },
+      });
+      mockIssueService.getByIdForUpdate.mockResolvedValue({
+        ...issue, executionPolicy: { ...issue.executionPolicy, stages: policy.stages },
+      });
+      const res = await request(await createApp(agent))
+        .patch(`/api/issues/${issue.id}`)
+        .send({ status: "done" });
+      expect(res.status).toBe(409);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
     });
 
     it("reroutes an agent's done request to the gated reviewer", async () => {

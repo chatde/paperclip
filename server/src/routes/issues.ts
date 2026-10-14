@@ -2183,14 +2183,14 @@ function applyActorMonitorScheduledBy(
 
 function stageSignature(stages: NonNullable<NormalizedExecutionPolicy>["stages"]) {
   return JSON.stringify(
-    stages.map((stage) => [
+    stages.map((stage) => JSON.stringify([
       stage.type,
       stage.participants.map((participant) =>
         participant.type === "agent"
           ? `agent:${participant.agentId}`
           : `user:${participant.userId}`,
-      ),
-    ]),
+      ).sort(),
+    ])).sort(),
   );
 }
 
@@ -2220,6 +2220,39 @@ function protectStagesFromAgentEdit(
   };
 }
 
+// Mirrors Hermes MODEL_PREFIX_PROVIDER_HINTS, with Gemini resolved to its
+// provider identity rather than the adapter's automatic routing hint.
+const reviewModelProviderHints: [string, string][] = [
+  ["mimo", "xiaomi"],
+  ["nvidia/", "nvidia"],
+  ["gpt-4", "openai-codex"],
+  ["gpt-5", "copilot"],
+  ["o1-", "openai-codex"],
+  ["o3-", "openai-codex"],
+  ["o4-", "openai-codex"],
+  ["claude", "anthropic"],
+  ["gemini", "gemini"],
+  ["hermes-", "nous"],
+  ["glm-", "zai"],
+  ["moonshot", "kimi-coding"],
+  ["kimi", "kimi-coding"],
+  ["minimax", "minimax"],
+  ["huggingface/", "huggingface"],
+];
+
+function reviewProviderForAgent(agent: {
+  adapterConfig: Record<string, unknown>;
+  adapterType: string;
+}): string | null {
+  const provider = readNonEmptyString(agent.adapterConfig?.provider)?.toLowerCase();
+  if (provider && provider !== "auto") return provider;
+  const model = readNonEmptyString(agent.adapterConfig?.model)?.toLowerCase();
+  const inferred = model
+    ? reviewModelProviderHints.find(([prefix]) => model.startsWith(prefix))?.[1]
+    : undefined;
+  return inferred ?? readNonEmptyString(agent.adapterType)?.toLowerCase() ?? null;
+}
+
 async function assertReviewProviderDiversity(
   agentsSvc: ReturnType<typeof agentService>,
   companyId: string,
@@ -2230,24 +2263,26 @@ async function assertReviewProviderDiversity(
     (stage) => stage.type === "review" &&
       stage.participants.every((participant) => participant.type === "agent"),
   ) ?? [];
-  if (!assigneeAgentId || reviewStages.length === 0) return;
+  if (reviewStages.length === 0) return;
   const providers = new Map<string, Promise<string | null>>();
   const providerFor = (agentId: string) => {
     if (!providers.has(agentId)) {
       providers.set(agentId, agentsSvc.getById(agentId).then((agent) => {
         if (!agent || agent.companyId !== companyId) return null;
-        return readNonEmptyString(agent.adapterConfig?.provider) ?? agent.adapterType;
+        return reviewProviderForAgent(agent);
       }));
     }
     return providers.get(agentId)!;
   };
-  const assigneeProvider = await providerFor(assigneeAgentId);
-  if (!assigneeProvider) return;
+  const assigneeProvider = assigneeAgentId ? await providerFor(assigneeAgentId) : null;
+  if (!assigneeProvider) {
+    throw forbidden("Review stage must include a reviewer on a different provider than the assignee");
+  }
   for (const stage of reviewStages) {
     const reviewerProviders = await Promise.all(stage.participants.map(
       (participant) => participant.agentId ? providerFor(participant.agentId) : null,
     ));
-    if (reviewerProviders.every((provider) => provider === assigneeProvider)) {
+    if (!reviewerProviders.some((provider) => provider !== null && provider !== assigneeProvider)) {
       throw forbidden("Review stage must include a reviewer on a different provider than the assignee");
     }
   }
@@ -11822,6 +11857,14 @@ export function issueRoutes(
         normalizeIssueExecutionPolicy(createBody.executionPolicy),
         actor.actorType,
       );
+      if (req.actor.type === "agent") {
+        await assertReviewProviderDiversity(
+          agentsSvc,
+          companyId,
+          createBody.assigneeAgentId ?? null,
+          executionPolicy,
+        );
+      }
       await assertCanManageIssueMonitor(
         access,
         req,
@@ -12169,6 +12212,14 @@ export function issueRoutes(
         normalizeIssueExecutionPolicy(createBody.executionPolicy),
         actor.actorType,
       );
+      if (req.actor.type === "agent") {
+        await assertReviewProviderDiversity(
+          agentsSvc,
+          parent.companyId,
+          createBody.assigneeAgentId ?? null,
+          executionPolicy,
+        );
+      }
       await assertCanManageIssueMonitor(
         access,
         req,
@@ -12393,6 +12444,14 @@ export function issueRoutes(
           normalizeIssueExecutionPolicy(child.executionPolicy),
           actor.actorType,
         );
+        if (req.actor.type === "agent") {
+          await assertReviewProviderDiversity(
+            agentsSvc,
+            sourceIssue.companyId,
+            child.assigneeAgentId ?? null,
+            executionPolicy,
+          );
+        }
         await assertCanManageIssueMonitor(
           access,
           req,
@@ -13177,10 +13236,10 @@ export function issueRoutes(
             actor,
           });
       }
-      if (req.body.executionPolicy !== undefined) {
-        const requestedExecutionPolicy = normalizeIssueExecutionPolicy(
-          req.body.executionPolicy,
-        );
+      const requestedExecutionPolicy = req.body.executionPolicy !== undefined
+        ? normalizeIssueExecutionPolicy(req.body.executionPolicy)
+        : undefined;
+      if (requestedExecutionPolicy !== undefined) {
         updateFields.executionPolicy = applyActorMonitorScheduledBy(
           req.actor.type === "agent"
             ? protectStagesFromAgentEdit(
@@ -13225,7 +13284,7 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
-      const transition = applyIssueExecutionPolicyTransition({
+      const transitionInput: Parameters<typeof applyIssueExecutionPolicyTransition>[0] = {
         issue: existing,
         policy: nextExecutionPolicy,
         previousPolicy: previousExecutionPolicy,
@@ -13249,7 +13308,8 @@ export function issueRoutes(
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
-      });
+      };
+      const transition = applyIssueExecutionPolicyTransition(transitionInput);
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -13620,11 +13680,82 @@ export function issueRoutes(
           ? svc.update(id, issueUpdateData, db, postCommitActivityPublications)
           : svc.update(id, issueUpdateData);
       };
-      const assertLockedReviewPolicyAllowsMutation = async (
+      const agentExecutionPolicyWrite =
+        req.actor.type === "agent" &&
+        (req.body.executionPolicy !== undefined || updateFields.executionPolicy !== undefined);
+      const assertLockedIssuePoliciesAllowMutation = async (
         tx: Parameters<typeof svc.update>[2],
       ) => {
         const lockedExisting = await svc.getByIdForUpdate(id, tx);
         if (!lockedExisting) return false;
+        if (agentExecutionPolicyWrite) {
+          const lockedPolicy = normalizeIssueExecutionPolicy(lockedExisting.executionPolicy ?? null);
+          const protectedPolicy = requestedExecutionPolicy === undefined
+            ? lockedPolicy
+            : applyActorMonitorScheduledBy(
+                protectStagesFromAgentEdit(
+                  lockedPolicy,
+                  requestedExecutionPolicy,
+                  res.locals.rawIssueExecutionPolicy,
+                ),
+                actor.actorType,
+              );
+          // Transition decisions were calculated from the initial snapshot. If
+          // their inputs changed, retry rather than persist a stale decision.
+          // A policy-only monitor edit can still merge newly added board stages.
+          if (
+            lockedExisting.status !== existing.status ||
+            lockedExisting.assigneeAgentId !== existing.assigneeAgentId ||
+            lockedExisting.assigneeUserId !== existing.assigneeUserId ||
+            JSON.stringify(lockedExisting.executionState) !== JSON.stringify(existing.executionState)
+          ) {
+            throw conflict("Issue execution policy changed during update; retry the request");
+          }
+          const rawPolicy = res.locals.rawIssueExecutionPolicy;
+          if (rawPolicy && typeof rawPolicy === "object" && "stages" in rawPolicy) {
+            await assertReviewProviderDiversity(
+              agentsSvc,
+              lockedExisting.companyId,
+              normalizedAssigneeAgentId === undefined
+                ? lockedExisting.assigneeAgentId
+                : normalizedAssigneeAgentId,
+              protectedPolicy,
+            );
+          }
+          await assertCanManageIssueMonitor(
+            access,
+            req,
+            lockedExisting.companyId,
+            lockedExisting.assigneeAgentId,
+            req.body.executionPolicy !== undefined && !monitorPoliciesEqual(lockedPolicy, protectedPolicy),
+          );
+          const lockedTransition = applyIssueExecutionPolicyTransition({
+            ...transitionInput,
+            issue: lockedExisting,
+            previousPolicy: lockedPolicy,
+            policy: protectedPolicy,
+            monitorExplicitlyUpdated:
+              req.body.executionPolicy !== undefined && !monitorPoliciesEqual(lockedPolicy, protectedPolicy),
+          });
+          if (
+            ["status", "assigneeAgentId", "assigneeUserId"].some(
+              (key) => lockedTransition.patch[key] !== transition.patch[key],
+            ) ||
+            JSON.stringify(lockedTransition.decision) !== JSON.stringify(transition.decision) ||
+            lockedTransition.workflowControlledAssignment !== transition.workflowControlledAssignment
+          ) {
+            throw conflict("Issue execution policy changed during update; retry the request");
+          }
+          if (decisionId && lockedTransition.patch.executionState) {
+            lockedTransition.patch.executionState = {
+              ...(lockedTransition.patch.executionState as Record<string, unknown>),
+              lastDecisionId: decisionId,
+            };
+          }
+          // Keep transition effects such as clearing a monitor on completion.
+          Object.assign(updateFields, { executionPolicy: protectedPolicy }, lockedTransition.patch);
+          Object.assign(issueUpdateData, { executionPolicy: protectedPolicy }, lockedTransition.patch);
+        }
         const lockedPolicyChangeRequested =
           req.body.reviewPolicy !== undefined &&
           req.body.reviewPolicy !== lockedExisting.reviewPolicy;
@@ -13738,13 +13869,14 @@ export function issueRoutes(
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
-        reviewPolicySensitiveMutationRequested;
+        reviewPolicySensitiveMutationRequested ||
+        agentExecutionPolicyWrite;
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
             if (
-              reviewPolicySensitiveMutationRequested &&
-              !(await assertLockedReviewPolicyAllowsMutation(tx))
+              (reviewPolicySensitiveMutationRequested || agentExecutionPolicyWrite) &&
+              !(await assertLockedIssuePoliciesAllowMutation(tx))
             )
               return null;
             const updated = await updateIssue(tx);
